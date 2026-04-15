@@ -65,6 +65,7 @@ pub mod base;
 pub mod call_spec;
 pub(crate) mod debug;
 pub mod errors;
+pub mod quantum;
 mod rlp_converter;
 pub mod tx;
 

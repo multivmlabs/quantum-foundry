@@ -2,6 +2,7 @@
 /target*
 /*.sol
 CLAUDE.md
+/thoughts
 
 # Foundry artifacts
 out/

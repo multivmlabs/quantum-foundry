@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use super::TempoOpts;
+use super::{QuantumOpts, TempoOpts};
 use crate::utils::{parse_ether_value, parse_json};
 use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_network::{Network, TransactionBuilder};
@@ -110,6 +110,9 @@ pub struct TransactionOpts {
 
     #[command(flatten)]
     pub tempo: TempoOpts,
+
+    #[command(flatten)]
+    pub quantum: QuantumOpts,
 }
 
 impl TransactionOpts {

@@ -1,0 +1,12 @@
+{
+  "source": "quantum-eth2/crates/primitives/src/rpc.rs",
+  "quantum_harness_commit": "8f3612c60f9fa66ea3a09eab99a2e0802f373673",
+  "precompile": "0x0000000000000000000000000000000000001000",
+  "selectors": {
+    "bootstrapKey": "0x5e8e7a13",
+    "addKey": "0x32bc2919",
+    "removeKey": "0xc98f21f4",
+    "updateKeyAuth": "0x8908154b"
+  },
+  "error_substring": "KeyVault lifecycle operations (bootstrap/addKey/removeKey/updateKeyAuth) cannot be simulated via eth_call; use explicit lifecycle transaction submission"
+}
