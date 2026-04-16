@@ -34,6 +34,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: "sccache"
+  QUANTUM_FOUNDRY_BASE_COMMIT: "f1abb2ca347187bb6dea8c3881ca44ce50aab1e7"
+  QUANTUM_HARNESS_COMMIT: "8f3612c60f9fa66ea3a09eab99a2e0802f373673"
 
 jobs:
   sanity-check:

@@ -13,7 +13,7 @@ use tempo_alloy::rpc::TempoTransactionRequest;
 use tempo_primitives::{TEMPO_TX_TYPE_ID, TempoTxType};
 
 use super::{FoundryTxEnvelope, FoundryTxType, FoundryTypedTx};
-use crate::FoundryNetwork;
+use crate::{FoundryNetwork, QUANTUM_TX_TYPE_ID, QuantumTransactionRequest, QuantumTxType};
 
 /// Foundry transaction request builder.
 ///
@@ -30,6 +30,7 @@ pub enum FoundryTransactionRequest {
     Ethereum(TransactionRequest),
     Op(WithOtherFields<TransactionRequest>),
     Tempo(Box<TempoTransactionRequest>),
+    Quantum(Box<QuantumTransactionRequest>),
 }
 
 impl FoundryTransactionRequest {
@@ -46,6 +47,7 @@ impl FoundryTransactionRequest {
             Self::Ethereum(tx) => tx,
             Self::Op(tx) => tx.inner,
             Self::Tempo(tx) => tx.inner,
+            Self::Quantum(tx) => tx.inner,
         }
     }
 
@@ -71,6 +73,7 @@ impl FoundryTransactionRequest {
             Self::Ethereum(tx) => tx.preferred_type().into(),
             Self::Op(_) => FoundryTxType::Deposit,
             Self::Tempo(_) => FoundryTxType::Tempo,
+            Self::Quantum(_) => FoundryTxType::Quantum,
         }
     }
 
@@ -106,6 +109,15 @@ impl FoundryTransactionRequest {
         }
     }
 
+    /// Check if all necessary keys are present to build a Quantum transaction, returning a list
+    /// of keys that are missing.
+    pub fn complete_quantum(&self) -> Result<(), Vec<&'static str>> {
+        match self {
+            Self::Quantum(tx) => tx.complete_type(QuantumTxType::Pq).map(|_| ()),
+            _ => Err(vec!["sender", "keyId"]),
+        }
+    }
+
     /// Check if all necessary keys are present to build a transaction.
     ///
     /// # Returns
@@ -122,6 +134,7 @@ impl FoundryTransactionRequest {
             FoundryTxType::Eip7702 => self.as_ref().complete_7702(),
             FoundryTxType::Deposit => self.complete_deposit(),
             FoundryTxType::Tempo => self.complete_tempo(),
+            FoundryTxType::Quantum => self.complete_quantum(),
         } {
             Err((pref, missing))
         } else {
@@ -153,6 +166,8 @@ impl FoundryTransactionRequest {
             Ok(FoundryTypedTx::Tempo(
                 tx_req.build_aa().map_err(|e| Self::Tempo(Box::new(e.into_value())))?,
             ))
+        } else if self.complete_quantum().is_ok() {
+            Err(self)
         } else if self.as_ref().has_eip4844_fields() && self.blob_sidecar().is_none() {
             // if request has eip4844 fields but no blob sidecar (neither eip4844 nor eip7594
             // format), try to build to eip4844 without sidecar
@@ -190,6 +205,7 @@ impl Serialize for FoundryTransactionRequest {
             Self::Ethereum(tx) => tx.serialize(serializer),
             Self::Op(tx) => tx.serialize(serializer),
             Self::Tempo(tx) => tx.serialize(serializer),
+            Self::Quantum(tx) => tx.serialize(serializer),
         }
     }
 }
@@ -209,6 +225,7 @@ impl AsRef<TransactionRequest> for FoundryTransactionRequest {
             Self::Ethereum(tx) => tx,
             Self::Op(tx) => tx,
             Self::Tempo(tx) => tx.as_ref(),
+            Self::Quantum(tx) => tx.as_ref().as_ref(),
         }
     }
 }
@@ -219,13 +236,55 @@ impl AsMut<TransactionRequest> for FoundryTransactionRequest {
             Self::Ethereum(tx) => tx,
             Self::Op(tx) => tx,
             Self::Tempo(tx) => tx.as_mut(),
+            Self::Quantum(tx) => tx.as_mut().as_mut(),
         }
     }
 }
 
 impl From<WithOtherFields<TransactionRequest>> for FoundryTransactionRequest {
     fn from(tx: WithOtherFields<TransactionRequest>) -> Self {
-        if tx.transaction_type == Some(TEMPO_TX_TYPE_ID)
+        if tx.transaction_type == Some(QUANTUM_TX_TYPE_ID)
+            || tx.other.contains_key("sender")
+            || tx.other.contains_key("keyId")
+            || tx.other.contains_key("initPrimaryPubkey")
+            || tx.other.contains_key("initCosignerPubkey")
+        {
+            let mut quantum_tx_req: QuantumTransactionRequest = tx.inner.into();
+            if let Some(sender) =
+                tx.other.get_deserialized::<Address>("sender").transpose().ok().flatten()
+            {
+                quantum_tx_req.sender = Some(sender);
+            }
+            if let Some(key_id) =
+                tx.other.get_deserialized::<u32>("keyId").transpose().ok().flatten()
+            {
+                quantum_tx_req.key_id = Some(key_id);
+            }
+            if let Some(nonce_key) =
+                tx.other.get_deserialized::<U256>("nonceKey").transpose().ok().flatten()
+            {
+                quantum_tx_req.nonce_key = Some(nonce_key);
+            }
+            if let Some(init_primary_pubkey) = tx
+                .other
+                .get_deserialized::<alloy_primitives::Bytes>("initPrimaryPubkey")
+                .transpose()
+                .ok()
+                .flatten()
+            {
+                quantum_tx_req.init_primary_pubkey = Some(init_primary_pubkey);
+            }
+            if let Some(init_cosigner_pubkey) = tx
+                .other
+                .get_deserialized::<alloy_primitives::Bytes>("initCosignerPubkey")
+                .transpose()
+                .ok()
+                .flatten()
+            {
+                quantum_tx_req.init_cosigner_pubkey = Some(init_cosigner_pubkey);
+            }
+            Self::Quantum(Box::new(quantum_tx_req))
+        } else if tx.transaction_type == Some(TEMPO_TX_TYPE_ID)
             || tx.other.contains_key("feeToken")
             || tx.other.contains_key("nonceKey")
         {
@@ -287,6 +346,7 @@ impl From<FoundryTypedTx> for FoundryTransactionRequest {
                 inner.transaction_type = Some(TEMPO_TX_TYPE_ID);
                 WithOtherFields { inner, other }.into()
             }
+            FoundryTypedTx::Quantum(tx) => Self::Quantum(Box::new(tx.into())),
         }
     }
 }
@@ -429,17 +489,22 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             FoundryTxType::Eip7702 => self.as_ref().complete_7702(),
             FoundryTxType::Deposit => self.complete_deposit(),
             FoundryTxType::Tempo => self.complete_tempo(),
+            FoundryTxType::Quantum => self.complete_quantum(),
         }
     }
 
     fn can_submit(&self) -> bool {
-        self.from().is_some()
+        match self {
+            Self::Quantum(tx) => tx.sender.is_some(),
+            _ => self.from().is_some(),
+        }
     }
 
     fn can_build(&self) -> bool {
         self.as_ref().can_build()
             || self.complete_deposit().is_ok()
             || self.complete_tempo().is_ok()
+            || self.complete_quantum().is_ok()
     }
 
     fn output_tx_type(&self) -> FoundryTxType {
@@ -456,6 +521,7 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             FoundryTxType::Eip7702 => self.as_ref().complete_7702().ok(),
             FoundryTxType::Deposit => self.complete_deposit().ok(),
             FoundryTxType::Tempo => self.complete_tempo().ok(),
+            FoundryTxType::Quantum => self.complete_quantum().ok(),
         }?;
         Some(pref)
     }
@@ -467,7 +533,10 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
         let inner = self.as_mut();
         inner.transaction_type = Some(preferred_type as u8);
         inner.gas.is_none().then(|| inner.set_gas_limit(Default::default()));
-        if !matches!(preferred_type, FoundryTxType::Deposit | FoundryTxType::Tempo) {
+        if !matches!(
+            preferred_type,
+            FoundryTxType::Deposit | FoundryTxType::Tempo | FoundryTxType::Quantum
+        ) {
             inner.trim_conflicting_keys();
             inner.populate_blob_hashes();
         }
@@ -486,6 +555,7 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
                 | FoundryTxType::Eip4844
                 | FoundryTxType::Eip7702
                 | FoundryTxType::Tempo
+                | FoundryTxType::Quantum
         ) {
             inner
                 .max_priority_fee_per_gas
@@ -503,6 +573,12 @@ impl NetworkTransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
     }
 
     fn build_unsigned(self) -> BuildResult<FoundryTypedTx, FoundryNetwork> {
+        if self.preferred_type() == FoundryTxType::Quantum {
+            return Err(TransactionBuilderError::custom(std::io::Error::other(
+                "building unsigned Quantum transactions is not supported; use the explicit Quantum raw-signing flow",
+            ))
+            .into_unbuilt(self));
+        }
         if let Err((tx_type, missing)) = self.missing_keys() {
             return Err(TransactionBuilderError::InvalidTransactionRequest(tx_type, missing)
                 .into_unbuilt(self));

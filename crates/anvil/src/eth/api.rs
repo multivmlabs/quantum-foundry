@@ -3526,6 +3526,9 @@ impl EthApi<FoundryNetwork> {
             FoundryTxEnvelope::Deposit(_) => self.backend.ensure_op_deposits_active(),
             FoundryTxEnvelope::Legacy(_) => Ok(()),
             FoundryTxEnvelope::Tempo(_) => self.backend.ensure_tempo_active(),
+            FoundryTxEnvelope::Quantum(_) => Err(BlockchainError::Message(
+                "quantum transactions are not supported by Anvil".to_string(),
+            )),
         }
     }
 }

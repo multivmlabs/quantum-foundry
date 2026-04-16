@@ -1,10 +1,12 @@
 use alloy_network::Network;
 
+mod quantum;
 mod receipt;
 
 use alloy_provider::fillers::{
     BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller, RecommendedFillers,
 };
+pub use quantum::*;
 pub use receipt::*;
 
 /// Foundry network type.

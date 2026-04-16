@@ -18,6 +18,7 @@ use alloy_rpc_types::{
     AccessListItem, Block, BlockTransactions, Header, Log, Transaction, TransactionReceipt,
 };
 use alloy_serde::{OtherFields, WithOtherFields};
+use foundry_primitives::{QUANTUM_TX_TYPE_ID, QuantumTxEnvelope, QuantumTxReceipt};
 use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
 use revm::context_interface::transaction::SignedAuthorization;
 use serde::Deserialize;
@@ -226,6 +227,12 @@ blobGasUsed          {}",
 impl UIfmt for TransactionReceipt {
     fn pretty(&self) -> String {
         pretty_receipt(self, self.transaction_type() as u8)
+    }
+}
+
+impl UIfmt for QuantumTxReceipt {
+    fn pretty(&self) -> String {
+        pretty_receipt(self, QUANTUM_TX_TYPE_ID)
     }
 }
 
@@ -616,6 +623,28 @@ impl UIfmt for TempoTxEnvelope {
     }
 }
 
+impl UIfmt for QuantumTxEnvelope {
+    fn pretty(&self) -> String {
+        format!(
+            "\nhash                 {}\ntype                 {}\nchainId              {}\nsender               {}\nnonceKey             {}\nnonce                {}\nkeyId                {}\nmaxPriorityFeePerGas {}\nmaxFeePerGas         {}\ngasLimit             {}\nto                   {}\nvalue                {}\naccessList           {}\ninput                {}",
+            self.tx_hash().pretty(),
+            self.ty(),
+            self.chain_id().pretty(),
+            self.sender().pretty(),
+            self.nonce_key().pretty(),
+            self.nonce().pretty(),
+            self.key_id(),
+            self.max_priority_fee_per_gas().pretty(),
+            self.max_fee_per_gas().pretty(),
+            self.gas_limit().pretty(),
+            self.to().pretty(),
+            self.value().pretty(),
+            self.access_list().cloned().unwrap_or_default().pretty(),
+            self.input().pretty(),
+        )
+    }
+}
+
 impl<T: UIfmt> UIfmt for Transaction<T> {
     fn pretty(&self) -> String {
         format!(
@@ -808,6 +837,12 @@ impl UIfmtSignatureExt for TempoTxEnvelope {
     }
 }
 
+impl UIfmtSignatureExt for QuantumTxEnvelope {
+    fn signature_pretty(&self) -> Option<(String, String, String)> {
+        None
+    }
+}
+
 pub trait UIfmtReceiptExt {
     fn logs_pretty(&self) -> String;
     fn logs_bloom_pretty(&self) -> String;
@@ -833,6 +868,20 @@ impl UIfmtReceiptExt for TransactionReceipt {
 
     fn tx_type_pretty(&self) -> String {
         self.transaction_type().to_string()
+    }
+}
+
+impl UIfmtReceiptExt for QuantumTxReceipt {
+    fn logs_pretty(&self) -> String {
+        receipt_logs_pretty(self)
+    }
+
+    fn logs_bloom_pretty(&self) -> String {
+        receipt_logs_bloom_pretty(self)
+    }
+
+    fn tx_type_pretty(&self) -> String {
+        QUANTUM_TX_TYPE_ID.to_string()
     }
 }
 

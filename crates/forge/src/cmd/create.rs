@@ -9,7 +9,7 @@ use alloy_provider::{PendingTransactionError, Provider, ProviderBuilder as Alloy
 use alloy_signer::{Signature, Signer};
 use alloy_transport::TransportError;
 use clap::{Parser, ValueHint};
-use eyre::{Context, Result};
+use eyre::{Context, Result, eyre};
 use forge_verify::{RetryArgs, VerifierArgs, VerifyArgs};
 use foundry_cli::{
     opts::{BuildOpts, EthereumOpts, EtherscanOpts, TransactionOpts},
@@ -19,6 +19,7 @@ use foundry_common::{
     FoundryTransactionBuilder,
     compile::{self},
     fmt::parse_tokens,
+    parse_seed_file, sign_quantum_transaction_request,
     provider::ProviderBuilder,
     shell,
 };
@@ -33,6 +34,7 @@ use foundry_config::{
     },
     merge_impl_figment_convert,
 };
+use foundry_primitives::QuantumNetwork;
 use foundry_wallets::{TempoAccessKeyConfig, WalletSigner};
 use serde_json::json;
 use std::{borrow::Borrow, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
@@ -106,6 +108,10 @@ pub struct CreateArgs {
 impl CreateArgs {
     /// Executes the command to create a contract
     pub async fn run(self) -> Result<()> {
+        if self.tx.quantum.is_quantum() {
+            return self.run_quantum().await;
+        }
+
         let (signer, tempo_access_key) = self.eth.wallet.maybe_signer().await?;
 
         if tempo_access_key.is_some() || self.tx.tempo.is_tempo() {
@@ -113,6 +119,100 @@ impl CreateArgs {
         } else {
             self.run_generic::<Ethereum>(signer, None).await
         }
+    }
+
+    async fn run_quantum(mut self) -> Result<()> {
+        if self.unlocked {
+            return Err(eyre!("the Quantum adapter path does not support --unlocked"));
+        }
+        if self.tx.tempo.is_tempo() {
+            return Err(eyre!("Quantum and Tempo options cannot be combined"));
+        }
+
+        let sender = self
+            .tx
+            .quantum
+            .sender
+            .ok_or_else(|| eyre!("--quantum.sender is required for Quantum writes"))?;
+        validate_quantum_sender(self.eth.wallet.from, sender)?;
+
+        let primary_seed = if self.broadcast {
+            let path = self.tx.quantum.primary_seed_file.as_ref().ok_or_else(|| {
+                eyre!("--quantum.primary-seed-file is required for Quantum writes")
+            })?;
+            Some(parse_seed_file(path)?)
+        } else {
+            self.tx.quantum.primary_seed_file.as_deref().map(parse_seed_file).transpose()?
+        };
+
+        let mut config = self.load_config()?;
+
+        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+        {
+            config = self.load_config()?;
+        }
+
+        let project = config.project()?;
+
+        let target_path = if let Some(ref mut path) = self.contract.path {
+            canonicalize(project.root().join(path))?
+        } else {
+            project.find_contract_path(&self.contract.name)?
+        };
+
+        let output = compile::compile_target(&target_path, &project, shell::is_json())?;
+        let (abi, bin, id) = find_contract_artifacts(output, &target_path, &self.contract.name)?;
+
+        let bin = match bin.object {
+            BytecodeObject::Bytecode(_) => bin.object,
+            _ => {
+                let link_refs = bin
+                    .link_references
+                    .iter()
+                    .flat_map(|(path, names)| {
+                        names.keys().map(move |name| format!("\t{name}: {path}"))
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n");
+                eyre::bail!(
+                    "Dynamic linking not supported in `create` command - deploy the following library contracts first, then provide the address to link at compile time\n{}",
+                    link_refs
+                )
+            }
+        };
+
+        let params = if let Some(constructor) = &abi.constructor {
+            let constructor_args =
+                self.constructor_args_path.clone().map(read_constructor_args_file).transpose()?;
+            self.parse_constructor_args(
+                constructor,
+                constructor_args.as_deref().unwrap_or(&self.constructor_args),
+            )?
+        } else {
+            vec![]
+        };
+
+        let provider = ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
+        let chain_id = if let Some(chain_id) = self.chain_id() {
+            chain_id
+        } else {
+            provider.get_chain_id().await?
+        };
+        let dry_run = !self.broadcast;
+
+        self.deploy_quantum(
+            abi,
+            bin,
+            params,
+            provider,
+            chain_id,
+            sender,
+            config.transaction_timeout,
+            id,
+            dry_run,
+            primary_seed,
+        )
+        .await
     }
 
     async fn run_generic<N: Network>(
@@ -540,6 +640,204 @@ impl CreateArgs {
         verify.run().await
     }
 
+    #[expect(clippy::too_many_arguments)]
+    async fn deploy_quantum<P: Provider<QuantumNetwork>>(
+        self,
+        abi: JsonAbi,
+        bin: BytecodeObject,
+        args: Vec<DynSolValue>,
+        provider: P,
+        chain: u64,
+        deployer_address: Address,
+        timeout: u64,
+        id: ArtifactId,
+        dry_run: bool,
+        primary_seed: Option<[u8; 32]>,
+    ) -> Result<()> {
+        let bin = bin.into_bytes().unwrap_or_default();
+        if bin.is_empty() {
+            eyre::bail!("no bytecode found in bin object for {}", self.contract.name)
+        }
+
+        let provider = Arc::new(provider);
+        let factory = ContractFactory::<QuantumNetwork, _>::new(
+            abi.clone(),
+            bin.clone(),
+            provider.clone(),
+            timeout,
+        );
+
+        let is_args_empty = args.is_empty();
+        let mut deployer = factory
+            .deploy_tokens(args.clone(), None)
+            .context("failed to deploy contract")
+            .map_err(|e| {
+                if is_args_empty {
+                    e.wrap_err(
+                        "no arguments provided for contract constructor; consider --constructor-args or --constructor-args-path",
+                    )
+                } else {
+                    e
+                }
+            })?;
+        let is_legacy = self.tx.legacy || Chain::from(chain).is_legacy();
+
+        deployer.tx.set_from(deployer_address);
+        deployer.tx.set_chain_id(chain);
+        if deployer.tx.to().is_none() {
+            deployer.tx.set_create();
+        }
+
+        self.tx.apply::<QuantumNetwork>(&mut deployer.tx, is_legacy);
+
+        if self.tx.nonce.is_none() {
+            deployer.tx.set_nonce(provider.get_transaction_count(deployer_address).await?);
+        }
+
+        if let Some(access_list) = match self.tx.access_list {
+            None => None,
+            Some(None) => Some(provider.create_access_list(&deployer.tx).await?.access_list),
+            Some(Some(ref access_list)) => Some(access_list.clone()),
+        } {
+            deployer.tx.set_access_list(access_list);
+        }
+
+        if self.tx.gas_limit.is_none() {
+            deployer.tx.set_gas_limit(provider.estimate_gas(deployer.tx.clone()).await?);
+        }
+
+        if is_legacy {
+            if self.tx.gas_price.is_none() {
+                deployer.tx.set_gas_price(provider.get_gas_price().await?);
+            }
+        } else if self.tx.gas_price.is_none() || self.tx.priority_gas_price.is_none() {
+            let estimate = provider.estimate_eip1559_fees().await.wrap_err(
+                "Failed to estimate EIP1559 fees. This chain might not support EIP1559, try adding --legacy to your command.",
+            )?;
+            if self.tx.priority_gas_price.is_none() {
+                deployer.tx.set_max_priority_fee_per_gas(estimate.max_priority_fee_per_gas);
+            }
+            if self.tx.gas_price.is_none() {
+                deployer.tx.set_max_fee_per_gas(estimate.max_fee_per_gas);
+            }
+        }
+
+        let mut constructor_args = None;
+        if self.verify {
+            if !args.is_empty() {
+                let encoded_args = abi
+                    .constructor()
+                    .ok_or_else(|| eyre!("could not find constructor"))?
+                    .abi_encode_input(&args)?;
+                constructor_args = Some(hex::encode(encoded_args));
+            }
+
+            self.verify_preflight_check(constructor_args.clone(), chain, &id).await?;
+        }
+
+        if dry_run {
+            if shell::is_json() {
+                let output = json!({
+                    "contract": self.contract.name,
+                    "transaction": &deployer.tx,
+                    "abi": &abi,
+                });
+                sh_println!("{}", serde_json::to_string_pretty(&output)?)?;
+            } else {
+                sh_warn!("Dry run enabled, not broadcasting transaction\n")?;
+                sh_println!("Contract: {}", self.contract.name)?;
+                sh_println!(
+                    "Transaction: {}",
+                    serde_json::to_string_pretty(&deployer.tx.clone())?
+                )?;
+                sh_println!("ABI: {}\n", serde_json::to_string_pretty(&abi)?)?;
+                sh_warn!(
+                    "To broadcast this transaction, add --broadcast to the previous command. See forge create --help for more."
+                )?;
+            }
+
+            return Ok(());
+        }
+
+        let primary_seed = primary_seed.ok_or_else(|| {
+            eyre!("--quantum.primary-seed-file is required for Quantum writes")
+        })?;
+
+        let raw_tx = sign_quantum_transaction_request(deployer.tx.clone(), primary_seed)?;
+        let receipt = provider
+            .send_raw_transaction(&raw_tx.raw_transaction)
+            .await?
+            .with_required_confirmations(1)
+            .with_timeout(Some(Duration::from_secs(timeout)))
+            .get_receipt()
+            .await?;
+
+        if !receipt.status() {
+            return Err(eyre!(
+                "deployment transaction failed (receipt status 0): {:?}",
+                receipt.transaction_hash()
+            ));
+        }
+
+        let address = receipt.contract_address().ok_or_else(|| eyre!("contract was not deployed"))?;
+        let tx_hash = receipt.transaction_hash();
+
+        if shell::is_json() {
+            let output = json!({
+                "deployer": deployer_address.to_string(),
+                "deployedTo": address.to_string(),
+                "transactionHash": tx_hash,
+            });
+            sh_println!("{}", serde_json::to_string_pretty(&output)?)?;
+        } else {
+            sh_println!("Deployer: {deployer_address}")?;
+            sh_println!("Deployed to: {address}")?;
+            sh_println!("Transaction hash: {tx_hash:?}")?;
+        }
+
+        if !self.verify {
+            return Ok(());
+        }
+
+        sh_println!("Starting contract verification...")?;
+
+        let num_of_optimizations = if let Some(optimizer) = self.build.compiler.optimize {
+            optimizer.then(|| self.build.compiler.optimizer_runs.unwrap_or(200))
+        } else {
+            self.build.compiler.optimizer_runs
+        };
+
+        let verify = VerifyArgs {
+            address,
+            contract: Some(self.contract),
+            compiler_version: Some(id.version.to_string()),
+            constructor_args,
+            constructor_args_path: None,
+            no_auto_detect: false,
+            use_solc: None,
+            num_of_optimizations,
+            etherscan: EtherscanOpts { key: self.eth.etherscan.key(), chain: Some(chain.into()) },
+            rpc: Default::default(),
+            flatten: false,
+            force: false,
+            skip_is_verified_check: true,
+            watch: true,
+            retry: self.retry,
+            libraries: self.build.libraries.clone(),
+            root: None,
+            verifier: self.verifier,
+            via_ir: self.build.via_ir,
+            evm_version: self.build.compiler.evm_version,
+            show_standard_json_input: self.show_standard_json_input,
+            guess_constructor_args: false,
+            compilation_profile: Some(id.profile.clone()),
+            language: None,
+            creation_transaction_hash: Some(tx_hash),
+        };
+        sh_println!("Waiting for {} to detect contract deployment...", verify.verifier.verifier)?;
+        verify.run().await
+    }
+
     /// Parses the given constructor arguments into a vector of `DynSolValue`s, by matching them
     /// against the constructor's input params.
     ///
@@ -568,6 +866,18 @@ impl CreateArgs {
         let params = params.iter().map(|(ty, arg)| (ty, arg.as_str()));
         parse_tokens(params).map_err(Into::into)
     }
+}
+
+fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -> Result<()> {
+    if let Some(from) = cli_from
+        && from != quantum_sender
+    {
+        eyre::bail!(
+            "--from must match --quantum.sender when using the Quantum adapter path"
+        )
+    }
+
+    Ok(())
 }
 
 impl figment::Provider for CreateArgs {

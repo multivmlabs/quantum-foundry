@@ -28,6 +28,7 @@ foundry-compilers.workspace = true
 foundry-config.workspace = true
 foundry-debugger.workspace = true
 foundry-evm.workspace = true
+foundry-primitives.workspace = true
 foundry-wallets.workspace = true
 forge-fmt.workspace = true
 
@@ -55,7 +56,6 @@ alloy-sol-types.workspace = true
 alloy-transport.workspace = true
 alloy-ens = { workspace = true, features = ["provider"] }
 alloy-eips.workspace = true
-ml-dsa = "0.1.0-rc.8"
 tempo-alloy.workspace = true
 tempo-contracts.workspace = true
 tempo-primitives.workspace = true

@@ -4,11 +4,13 @@ use alloy_consensus::{
     BlobTransactionSidecar, BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant,
 };
 use alloy_eips::{Encodable2718, eip7702::SignedAuthorization};
-use alloy_network::{AnyNetwork, Ethereum, Network, NetworkTransactionBuilder};
-use alloy_primitives::{Address, B256, Signature, TxKind, U256};
+use alloy_network::{AnyNetwork, Ethereum, Network, NetworkTransactionBuilder, TransactionBuilder};
+use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256, address, keccak256};
 use alloy_provider::Provider;
+use alloy_rlp::{BufMut, Encodable, Header as RlpHeader};
 use alloy_signer::Signer;
-use eyre::Result;
+use eyre::{Result, bail, ensure};
+use foundry_primitives::{QuantumNetwork, QuantumTransactionRequest};
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::OpTransactionRequest;
 use tempo_alloy::{TempoNetwork, provider::TempoProviderExt};
@@ -229,6 +231,76 @@ pub trait FoundryTransactionBuilder<N: Network>: NetworkTransactionBuilder<N> {
         self
     }
 
+    /// Get the explicit Quantum sender for a Quantum transaction.
+    fn quantum_sender(&self) -> Option<Address> {
+        None
+    }
+
+    /// Set the explicit Quantum sender for a Quantum transaction.
+    fn set_quantum_sender(&mut self, _sender: Address) {}
+
+    /// Builder-pattern method for setting the explicit Quantum sender.
+    fn with_quantum_sender(mut self, sender: Address) -> Self {
+        self.set_quantum_sender(sender);
+        self
+    }
+
+    /// Get the explicit Quantum key lane for a Quantum transaction.
+    fn quantum_key_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// Set the explicit Quantum key lane for a Quantum transaction.
+    fn set_quantum_key_id(&mut self, _key_id: u32) {}
+
+    /// Builder-pattern method for setting the explicit Quantum key lane.
+    fn with_quantum_key_id(mut self, key_id: u32) -> Self {
+        self.set_quantum_key_id(key_id);
+        self
+    }
+
+    /// Get the Quantum nonce lane for a Quantum transaction.
+    fn quantum_nonce_key(&self) -> Option<U256> {
+        None
+    }
+
+    /// Set the Quantum nonce lane for a Quantum transaction.
+    fn set_quantum_nonce_key(&mut self, _nonce_key: U256) {}
+
+    /// Builder-pattern method for setting the Quantum nonce lane.
+    fn with_quantum_nonce_key(mut self, nonce_key: U256) -> Self {
+        self.set_quantum_nonce_key(nonce_key);
+        self
+    }
+
+    /// Get the Quantum bootstrap primary pubkey for a Quantum transaction.
+    fn quantum_init_primary_pubkey(&self) -> Option<&Bytes> {
+        None
+    }
+
+    /// Set the Quantum bootstrap primary pubkey for a Quantum transaction.
+    fn set_quantum_init_primary_pubkey(&mut self, _pubkey: Bytes) {}
+
+    /// Builder-pattern method for setting the Quantum bootstrap primary pubkey.
+    fn with_quantum_init_primary_pubkey(mut self, pubkey: Bytes) -> Self {
+        self.set_quantum_init_primary_pubkey(pubkey);
+        self
+    }
+
+    /// Get the Quantum bootstrap cosigner pubkey for a Quantum transaction.
+    fn quantum_init_cosigner_pubkey(&self) -> Option<&Bytes> {
+        None
+    }
+
+    /// Set the Quantum bootstrap cosigner pubkey for a Quantum transaction.
+    fn set_quantum_init_cosigner_pubkey(&mut self, _pubkey: Bytes) {}
+
+    /// Builder-pattern method for setting the Quantum bootstrap cosigner pubkey.
+    fn with_quantum_init_cosigner_pubkey(mut self, pubkey: Bytes) -> Self {
+        self.set_quantum_init_cosigner_pubkey(pubkey);
+        self
+    }
+
     /// Computes the sponsor (fee payer) signature hash for this transaction.
     ///
     /// This builds an unsigned consensus-level transaction from the request and computes
@@ -274,6 +346,246 @@ pub trait FoundryTransactionBuilder<N: Network>: NetworkTransactionBuilder<N> {
         _key_authorization: Option<&SignedKeyAuthorization>,
     ) -> impl Future<Output = Result<Vec<u8>>> + Send {
         async { eyre::bail!("access key signing is not supported for this network") }
+    }
+}
+
+pub const QUANTUM_TX_TYPE_ID: u8 = 0x7A;
+pub const QUANTUM_KEYVAULT_ADDRESS: Address = address!("0000000000000000000000000000000000001000");
+pub const QUANTUM_BOOTSTRAP_SELECTOR: [u8; 4] = [0x5e, 0x8e, 0x7a, 0x13];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumSingleCall {
+    pub kind: TxKind,
+    pub value: U256,
+    pub input: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumBootstrapFieldsV1 {
+    pub init_primary_pubkey: Bytes,
+    pub init_cosigner_pubkey: Option<Bytes>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumWriteRequestInputsV1 {
+    pub sender: Address,
+    pub key_id: u32,
+    pub nonce_key: Option<U256>,
+    pub bootstrap: Option<QuantumBootstrapFieldsV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantumWriteRequestV1 {
+    pub sender: Address,
+    pub key_id: u32,
+    pub nonce: u64,
+    pub chain_id: u64,
+    pub max_priority_fee_per_gas: u128,
+    pub max_fee_per_gas: u128,
+    pub gas_limit: u64,
+    pub call: QuantumSingleCall,
+    pub access_list: alloy_eips::eip2930::AccessList,
+    pub bootstrap: Option<QuantumBootstrapFieldsV1>,
+}
+
+impl QuantumWriteRequestV1 {
+    pub fn from_transaction_request<B: TransactionBuilder>(
+        tx: &B,
+        inputs: QuantumWriteRequestInputsV1,
+    ) -> Result<Self> {
+        if let Some(nonce_key) = inputs.nonce_key
+            && nonce_key != U256::ZERO
+        {
+            bail!("Quantum v1 only supports nonce_key = 0")
+        }
+
+        let request = Self {
+            sender: inputs.sender,
+            key_id: inputs.key_id,
+            nonce: TransactionBuilder::nonce(tx)
+                .ok_or_else(|| eyre::eyre!("Quantum request missing nonce"))?,
+            chain_id: TransactionBuilder::chain_id(tx)
+                .ok_or_else(|| eyre::eyre!("Quantum request missing chain_id"))?,
+            max_priority_fee_per_gas: TransactionBuilder::max_priority_fee_per_gas(tx)
+                .ok_or_else(|| eyre::eyre!("Quantum request missing max_priority_fee_per_gas"))?,
+            max_fee_per_gas: TransactionBuilder::max_fee_per_gas(tx)
+                .ok_or_else(|| eyre::eyre!("Quantum request missing max_fee_per_gas"))?,
+            gas_limit: TransactionBuilder::gas_limit(tx)
+                .ok_or_else(|| eyre::eyre!("Quantum request missing gas_limit"))?,
+            call: QuantumSingleCall {
+                kind: TransactionBuilder::kind(tx)
+                    .ok_or_else(|| eyre::eyre!("Quantum request missing call or CREATE kind"))?,
+                value: TransactionBuilder::value(tx).unwrap_or_default(),
+                input: TransactionBuilder::input(tx).cloned().unwrap_or_default(),
+            },
+            access_list: TransactionBuilder::access_list(tx).cloned().unwrap_or_default(),
+            bootstrap: inputs.bootstrap,
+        };
+
+        request.validate_v1()?;
+        Ok(request)
+    }
+
+    pub fn from_quantum_transaction_request(tx: &QuantumTransactionRequest) -> Result<Self> {
+        let bootstrap = match (tx.init_primary_pubkey.clone(), tx.init_cosigner_pubkey.clone()) {
+            (None, None) => None,
+            (Some(init_primary_pubkey), init_cosigner_pubkey) => {
+                Some(QuantumBootstrapFieldsV1 { init_primary_pubkey, init_cosigner_pubkey })
+            }
+            (None, Some(_)) => {
+                bail!("Quantum bootstrap cosigner pubkey requires an accompanying primary pubkey")
+            }
+        };
+
+        Self::from_transaction_request(
+            tx,
+            QuantumWriteRequestInputsV1 {
+                sender: tx.sender.ok_or_else(|| eyre::eyre!("Quantum request missing sender"))?,
+                key_id: tx.key_id.unwrap_or(0),
+                nonce_key: Some(tx.nonce_key.unwrap_or(U256::ZERO)),
+                bootstrap,
+            },
+        )
+    }
+
+    pub fn validate_v1(&self) -> Result<()> {
+        ensure!(self.sender != Address::ZERO, "Quantum sender must be explicit and non-zero");
+        ensure!(
+            self.max_priority_fee_per_gas <= self.max_fee_per_gas,
+            "max priority fee must not exceed max fee"
+        );
+
+        if let Some(bootstrap) = &self.bootstrap {
+            ensure!(
+                self.is_bootstrap_call(),
+                "Quantum bootstrap fields are only valid for bootstrapKey() writes"
+            );
+            ensure!(
+                bootstrap.init_cosigner_pubkey.is_none(),
+                "Quantum bootstrap remains primary-only in v1"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn is_bootstrap_call(&self) -> bool {
+        matches!(self.call.kind, TxKind::Call(to) if to == QUANTUM_KEYVAULT_ADDRESS)
+            && self.call.input.as_ref().starts_with(&QUANTUM_BOOTSTRAP_SELECTOR)
+    }
+
+    pub fn encode_fields(&self, out: &mut dyn BufMut) {
+        self.chain_id.encode(out);
+        self.sender.encode(out);
+        U256::ZERO.encode(out);
+        self.nonce.encode(out);
+        self.key_id.encode(out);
+        self.max_priority_fee_per_gas.encode(out);
+        self.max_fee_per_gas.encode(out);
+        self.gas_limit.encode(out);
+        encode_single_call_list(&self.call, out);
+        self.access_list.encode(out);
+        encode_option_as_list::<Address>(None, out);
+        encode_option_as_list::<u32>(None, out);
+        encode_option_as_list(
+            self.bootstrap.as_ref().map(|bootstrap| &bootstrap.init_primary_pubkey),
+            out,
+        );
+        encode_option_as_list(
+            self.bootstrap.as_ref().and_then(|bootstrap| bootstrap.init_cosigner_pubkey.as_ref()),
+            out,
+        );
+    }
+
+    pub fn encoded_fields_length(&self) -> usize {
+        self.chain_id.length()
+            + self.sender.length()
+            + U256::ZERO.length()
+            + self.nonce.length()
+            + self.key_id.length()
+            + self.max_priority_fee_per_gas.length()
+            + self.max_fee_per_gas.length()
+            + self.gas_limit.length()
+            + single_call_list_length(&self.call)
+            + self.access_list.length()
+            + option_as_list_length::<Address>(None)
+            + option_as_list_length::<u32>(None)
+            + option_as_list_length(
+                self.bootstrap.as_ref().map(|bootstrap| &bootstrap.init_primary_pubkey),
+            )
+            + option_as_list_length(
+                self.bootstrap
+                    .as_ref()
+                    .and_then(|bootstrap| bootstrap.init_cosigner_pubkey.as_ref()),
+            )
+    }
+
+    pub fn encode_for_signing(&self, out: &mut dyn BufMut) {
+        out.put_u8(QUANTUM_TX_TYPE_ID);
+        let payload_len = self.encoded_fields_length();
+        RlpHeader { list: true, payload_length: payload_len }.encode(out);
+        self.encode_fields(out);
+    }
+
+    pub fn encode_body(&self, out: &mut dyn BufMut) {
+        let payload_len = self.encoded_fields_length();
+        RlpHeader { list: true, payload_length: payload_len }.encode(out);
+        self.encode_fields(out);
+    }
+
+    pub fn signature_hash(&self) -> B256 {
+        let mut buf = Vec::new();
+        self.encode_for_signing(&mut buf);
+        keccak256(buf)
+    }
+}
+
+impl Encodable for QuantumSingleCall {
+    fn encode(&self, out: &mut dyn BufMut) {
+        let payload_len = self.kind.length() + self.value.length() + self.input.length();
+        RlpHeader { list: true, payload_length: payload_len }.encode(out);
+        self.kind.encode(out);
+        self.value.encode(out);
+        self.input.encode(out);
+    }
+
+    fn length(&self) -> usize {
+        let payload_len = self.kind.length() + self.value.length() + self.input.length();
+        alloy_rlp::length_of_length(payload_len) + payload_len
+    }
+}
+
+fn encode_single_call_list(call: &QuantumSingleCall, out: &mut dyn BufMut) {
+    let payload_length = call.length();
+    RlpHeader { list: true, payload_length }.encode(out);
+    call.encode(out);
+}
+
+fn single_call_list_length(call: &QuantumSingleCall) -> usize {
+    let payload_length = call.length();
+    alloy_rlp::length_of_length(payload_length) + payload_length
+}
+
+fn encode_option_as_list<T: Encodable>(value: Option<&T>, out: &mut dyn BufMut) {
+    match value {
+        Some(value) => {
+            let payload_length = value.length();
+            RlpHeader { list: true, payload_length }.encode(out);
+            value.encode(out);
+        }
+        None => {
+            RlpHeader { list: true, payload_length: 0 }.encode(out);
+        }
+    }
+}
+
+fn option_as_list_length<T: Encodable>(value: Option<&T>) -> usize {
+    match value {
+        Some(value) => {
+            let payload_length = value.length();
+            alloy_rlp::length_of_length(payload_length) + payload_length
+        }
+        None => 1,
     }
 }
 
@@ -494,5 +806,260 @@ impl FoundryTransactionBuilder<TempoNetwork> for <TempoNetwork as Network>::Tran
             aa_signed.encode_2718(&mut buf);
             Ok(buf)
         }
+    }
+}
+
+impl FoundryTransactionBuilder<QuantumNetwork> for QuantumTransactionRequest {
+    fn reset_gas_limit(&mut self) {
+        self.inner.gas = None;
+    }
+
+    fn quantum_sender(&self) -> Option<Address> {
+        self.sender
+    }
+
+    fn set_quantum_sender(&mut self, sender: Address) {
+        self.sender = Some(sender);
+    }
+
+    fn quantum_key_id(&self) -> Option<u32> {
+        self.key_id
+    }
+
+    fn set_quantum_key_id(&mut self, key_id: u32) {
+        self.key_id = Some(key_id);
+    }
+
+    fn quantum_nonce_key(&self) -> Option<U256> {
+        self.nonce_key
+    }
+
+    fn set_quantum_nonce_key(&mut self, nonce_key: U256) {
+        self.nonce_key = Some(nonce_key);
+    }
+
+    fn quantum_init_primary_pubkey(&self) -> Option<&Bytes> {
+        self.init_primary_pubkey.as_ref()
+    }
+
+    fn set_quantum_init_primary_pubkey(&mut self, pubkey: Bytes) {
+        self.init_primary_pubkey = Some(pubkey);
+    }
+
+    fn quantum_init_cosigner_pubkey(&self) -> Option<&Bytes> {
+        self.init_cosigner_pubkey.as_ref()
+    }
+
+    fn set_quantum_init_cosigner_pubkey(&mut self, pubkey: Bytes) {
+        self.init_cosigner_pubkey = Some(pubkey);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_rpc_types::TransactionRequest;
+
+    use super::*;
+
+    fn base_eth_request() -> TransactionRequest {
+        TransactionRequest::default()
+            .with_to(Address::ZERO)
+            .with_nonce(42)
+            .with_gas_limit(21_000)
+            .with_max_fee_per_gas(50_000_000_000u128)
+            .with_max_priority_fee_per_gas(1_000_000_000u128)
+            .with_value(U256::from(1_000_000_000_000_000_000u128))
+            .with_input(Bytes::from_static(b"hello"))
+            .with_chain_id(1337)
+    }
+
+    #[test]
+    fn quantum_request_signature_hash_matches_source_of_truth() {
+        let request = QuantumWriteRequestV1 {
+            sender: Address::ZERO,
+            key_id: 0,
+            nonce: 42,
+            chain_id: 1337,
+            max_priority_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas: 50_000_000_000,
+            gas_limit: 21_000,
+            call: QuantumSingleCall {
+                kind: TxKind::Call(Address::ZERO),
+                value: U256::from(1_000_000_000_000_000_000u128),
+                input: Bytes::from_static(b"hello"),
+            },
+            access_list: Default::default(),
+            bootstrap: None,
+        };
+
+        let mut buf = Vec::new();
+        request.encode_body(&mut buf);
+        assert_eq!(
+            format!("{:#x}", keccak256(&buf)),
+            "0xd039fbca7d51e653c90e8b84adb8fa6e30929dffa7eb41dbd6ec40594ce3ad4e"
+        );
+        assert_eq!(
+            format!("{:#x}", request.signature_hash()),
+            "0x909fe4db64c4605eb394b9de4d064bce0ab6d718b32050f00d80d7f525753b7d"
+        );
+    }
+
+    #[test]
+    fn quantum_request_requires_explicit_sender() {
+        let err = QuantumWriteRequestV1::from_transaction_request(
+            &base_eth_request(),
+            QuantumWriteRequestInputsV1 {
+                sender: Address::ZERO,
+                key_id: 0,
+                nonce_key: None,
+                bootstrap: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("explicit and non-zero"));
+    }
+
+    #[test]
+    fn quantum_request_rejects_nonzero_nonce_key() {
+        let err = QuantumWriteRequestV1::from_transaction_request(
+            &base_eth_request(),
+            QuantumWriteRequestInputsV1 {
+                sender: Address::repeat_byte(0x11),
+                key_id: 7,
+                nonce_key: Some(U256::from(1u64)),
+                bootstrap: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Quantum v1 only supports nonce_key = 0");
+    }
+
+    #[test]
+    fn quantum_request_rejects_bootstrap_fields_outside_bootstrap() {
+        let err = QuantumWriteRequestV1::from_transaction_request(
+            &base_eth_request(),
+            QuantumWriteRequestInputsV1 {
+                sender: Address::repeat_byte(0x11),
+                key_id: 0,
+                nonce_key: None,
+                bootstrap: Some(QuantumBootstrapFieldsV1 {
+                    init_primary_pubkey: Bytes::from(vec![0x01, 0x02]),
+                    init_cosigner_pubkey: None,
+                }),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Quantum bootstrap fields are only valid for bootstrapKey() writes"
+        );
+    }
+
+    #[test]
+    fn quantum_request_rejects_bootstrap_cosigner_fields_in_v1() {
+        let bootstrap_tx = TransactionRequest::default()
+            .with_to(QUANTUM_KEYVAULT_ADDRESS)
+            .with_nonce(0)
+            .with_gas_limit(21_000)
+            .with_max_fee_per_gas(1_000_000_000u128)
+            .with_max_priority_fee_per_gas(1_000_000u128)
+            .with_input(Bytes::from(QUANTUM_BOOTSTRAP_SELECTOR.to_vec()))
+            .with_chain_id(1337);
+
+        let err = QuantumWriteRequestV1::from_transaction_request(
+            &bootstrap_tx,
+            QuantumWriteRequestInputsV1 {
+                sender: Address::repeat_byte(0x11),
+                key_id: 0,
+                nonce_key: None,
+                bootstrap: Some(QuantumBootstrapFieldsV1 {
+                    init_primary_pubkey: Bytes::from(vec![0x01, 0x02]),
+                    init_cosigner_pubkey: Some(Bytes::from(vec![0x03, 0x04])),
+                }),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Quantum bootstrap remains primary-only in v1");
+    }
+
+    #[test]
+    fn quantum_request_preserves_create_as_single_call() {
+        let mut create_tx = TransactionRequest::default()
+            .with_nonce(3)
+            .with_gas_limit(120_000)
+            .with_max_fee_per_gas(1_000_000_000u128)
+            .with_max_priority_fee_per_gas(1_000_000u128)
+            .with_input(Bytes::from(vec![0x60, 0x00, 0x60, 0x00]))
+            .with_chain_id(1337);
+        create_tx.to = Some(TxKind::Create);
+
+        let request = QuantumWriteRequestV1::from_transaction_request(
+            &create_tx,
+            QuantumWriteRequestInputsV1 {
+                sender: Address::repeat_byte(0x22),
+                key_id: 9,
+                nonce_key: None,
+                bootstrap: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(request.call.kind, TxKind::Create));
+        assert_eq!(request.call.input, Bytes::from(vec![0x60, 0x00, 0x60, 0x00]));
+    }
+
+    #[test]
+    fn quantum_request_from_quantum_transaction_request_preserves_quantum_fields() {
+        let request = QuantumTransactionRequest {
+            inner: TransactionRequest::default()
+                .with_chain_id(1337)
+                .with_nonce(9)
+                .with_to(Address::repeat_byte(0x44))
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(10)
+                .with_max_priority_fee_per_gas(1)
+                .with_value(U256::from(5u64))
+                .with_input(Bytes::from(vec![0xde, 0xad])),
+            sender: Some(Address::repeat_byte(0x22)),
+            key_id: Some(7),
+            nonce_key: Some(U256::ZERO),
+            init_primary_pubkey: None,
+            init_cosigner_pubkey: None,
+        };
+
+        let write_request =
+            QuantumWriteRequestV1::from_quantum_transaction_request(&request).unwrap();
+
+        assert_eq!(write_request.sender, Address::repeat_byte(0x22));
+        assert_eq!(write_request.key_id, 7);
+        assert!(
+            matches!(write_request.call.kind, TxKind::Call(to) if to == Address::repeat_byte(0x44))
+        );
+        assert_eq!(write_request.call.input, Bytes::from(vec![0xde, 0xad]));
+    }
+
+    #[test]
+    fn quantum_request_from_quantum_transaction_request_rejects_nonzero_nonce_key() {
+        let request = QuantumTransactionRequest {
+            inner: TransactionRequest::default()
+                .with_chain_id(1337)
+                .with_nonce(9)
+                .with_to(Address::repeat_byte(0x44))
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(10)
+                .with_max_priority_fee_per_gas(1),
+            sender: Some(Address::repeat_byte(0x22)),
+            key_id: Some(7),
+            nonce_key: Some(U256::from(1u64)),
+            init_primary_pubkey: None,
+            init_cosigner_pubkey: None,
+        };
+
+        let err = QuantumWriteRequestV1::from_quantum_transaction_request(&request).unwrap_err();
+        assert_eq!(err.to_string(), "Quantum v1 only supports nonce_key = 0");
     }
 }

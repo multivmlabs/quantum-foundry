@@ -44,6 +44,9 @@ impl DAEstimateArgs {
             NetworkVariant::Tempo => Err(eyre::eyre!(
                 "DA estimation is not supported for Tempo: EIP-4844 blob transactions are not available on this network"
             )),
+            NetworkVariant::Quantum => Err(eyre::eyre!(
+                "DA estimation is not supported for Quantum: the first-class QuantumNetwork adapter does not implement this path yet"
+            )),
         }
     }
 }

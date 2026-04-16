@@ -137,6 +137,12 @@ impl Signer<foundry_primitives::FoundryNetwork> for DevSigner {
                 let sig = signer.sign_transaction_sync(&mut t)?;
                 FoundryTxEnvelope::Tempo(t.into_signed(sig.into()))
             }
+            FoundryTypedTx::Quantum(_) => {
+                return Err(BlockchainError::Message(
+                    "Quantum transactions must be pre-signed and are not supported by Anvil's dev signer"
+                        .to_string(),
+                ))
+            }
         };
         Ok(envelope)
     }
@@ -158,5 +164,6 @@ pub fn build_impersonated(typed_tx: FoundryTypedTx) -> FoundryTxEnvelope {
             let tempo_sig: TempoSignature = signature.into();
             FoundryTxEnvelope::Tempo(tx.into_signed(tempo_sig))
         }
+        FoundryTypedTx::Quantum(tx) => FoundryTxEnvelope::Quantum(tx),
     }
 }

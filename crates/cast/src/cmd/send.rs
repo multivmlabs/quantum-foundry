@@ -2,24 +2,25 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_ens::NameOrAddress;
-use alloy_network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
-use alloy_primitives::Address;
+use alloy_network::{Ethereum, EthereumWallet, Network};
+use alloy_primitives::{Address, hex};
 use alloy_provider::{Provider, ProviderBuilder as AlloyProviderBuilder};
 use alloy_signer::{Signature, Signer};
 use clap::Parser;
 use eyre::{Result, eyre};
 use foundry_cli::{opts::TransactionOpts, utils::LoadConfig};
 use foundry_common::{
-    FoundryTransactionBuilder,
+    FoundryTransactionBuilder, QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS,
+    derive_primary_pubkey, parse_seed_file, sign_quantum_transaction_request,
     fmt::{UIfmt, UIfmtReceiptExt},
     provider::ProviderBuilder,
 };
+use foundry_primitives::QuantumNetwork;
 use foundry_wallets::{TempoAccessKeyConfig, WalletSigner};
 use tempo_alloy::TempoNetwork;
 
 use crate::{
     cmd::tip20::iso4217_warning_message,
-    quantum::{QuantumWriteContractV1, build_phase0_payload, parse_seed_file},
     tx::{self, CastTxBuilder, CastTxSender, SendTxOpts},
 };
 use tempo_contracts::precompiles::{TIP20_FACTORY_ADDRESS, is_iso4217_currency};
@@ -109,38 +110,57 @@ impl SendTxArgs {
     }
 
     async fn run_quantum(self) -> Result<()> {
-        let Self { to, mut sig, args, data, send_tx, command, unlocked, force: _, tx, path } =
-            self;
+        let Self {
+            to,
+            mut sig,
+            args,
+            data,
+            send_tx,
+            command,
+            unlocked,
+            force: _,
+            mut tx,
+            path,
+        } = self;
 
         if unlocked {
-            return Err(eyre!("the Phase 0 Quantum seam does not support --unlocked"));
+            return Err(eyre!("the Quantum adapter path does not support --unlocked"));
         }
         if send_tx.browser.browser {
-            return Err(eyre!("the Phase 0 Quantum seam does not support browser signing"));
+            return Err(eyre!("the Quantum adapter path does not support browser signing"));
         }
         if tx.tempo.is_tempo() {
             return Err(eyre!("Quantum and Tempo options cannot be combined"));
         }
         if command.is_some() {
-            return Err(eyre!("the Phase 0 Quantum seam only supports cast send-style call flows"));
+            return Err(eyre!("the Quantum adapter path only supports cast send-style call flows"));
         }
         if path.is_some() {
-            return Err(eyre!("the Phase 0 Quantum seam does not support blob data"));
+            return Err(eyre!("the Quantum adapter path does not support blob data"));
         }
         if let Some(data) = data {
             sig = Some(data);
         }
 
-        let sender = tx.quantum.sender.ok_or_else(|| {
-            eyre!("--quantum.sender is required for the Phase 0 Quantum seam")
-        })?;
-        let seed_path = tx.quantum.primary_seed_file.as_ref().ok_or_else(|| {
-            eyre!("--quantum.primary-seed-file is required for the Phase 0 Quantum seam")
-        })?;
+        let sender = tx
+            .quantum
+            .sender
+            .ok_or_else(|| eyre!("--quantum.sender is required for Quantum writes"))?;
+        validate_quantum_sender(send_tx.eth.wallet.from, sender)?;
+        let seed_path =
+            tx.quantum.primary_seed_file.as_ref().ok_or_else(|| {
+                eyre!("--quantum.primary-seed-file is required for Quantum writes")
+            })?;
         let primary_seed = parse_seed_file(seed_path)?;
 
+        if quantum_send_requests_bootstrap(to.as_ref(), sig.as_deref())
+            && tx.quantum.init_primary_pubkey.is_none()
+        {
+            tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+        }
+
         let config = send_tx.eth.load_config()?;
-        let provider = ProviderBuilder::<Ethereum>::from_config(&config)?.build()?;
+        let provider = ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
 
         if let Some(interval) = send_tx.poll_interval {
             provider.client().set_poll_interval(Duration::from_secs(interval));
@@ -154,37 +174,7 @@ impl SendTxArgs {
             .await?;
 
         let (tx_request, _) = builder.build(sender).await?;
-        let kind = TransactionBuilder::kind(&tx_request)
-            .ok_or_else(|| eyre!("Quantum Phase 0 requires an explicit call destination"))?;
-        let max_fee_per_gas = TransactionBuilder::max_fee_per_gas(&tx_request)
-            .ok_or_else(|| eyre!("failed to resolve max fee per gas for Quantum transaction"))?;
-        let max_priority_fee_per_gas = TransactionBuilder::max_priority_fee_per_gas(&tx_request)
-            .ok_or_else(|| {
-                eyre!("failed to resolve max priority fee per gas for Quantum transaction")
-            })?;
-        let gas_limit = TransactionBuilder::gas_limit(&tx_request)
-            .ok_or_else(|| eyre!("failed to resolve gas limit for Quantum transaction"))?;
-        let nonce = TransactionBuilder::nonce(&tx_request)
-            .ok_or_else(|| eyre!("failed to resolve nonce for Quantum transaction"))?;
-        let chain_id = TransactionBuilder::chain_id(&tx_request)
-            .ok_or_else(|| eyre!("failed to resolve chain ID for Quantum transaction"))?;
-
-        let payload = build_phase0_payload(QuantumWriteContractV1 {
-            sender,
-            key_id: tx.quantum.resolved_key_id(),
-            nonce,
-            chain_id,
-            max_priority_fee_per_gas,
-            max_fee_per_gas,
-            gas_limit,
-            kind,
-            value: TransactionBuilder::value(&tx_request).unwrap_or_default(),
-            input: TransactionBuilder::input(&tx_request).cloned().unwrap_or_default(),
-            access_list: TransactionBuilder::access_list(&tx_request)
-                .cloned()
-                .unwrap_or_default(),
-            primary_seed,
-        })?;
+        let payload = sign_quantum_transaction_request(tx_request, primary_seed)?;
 
         let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
         let cast = CastTxSender::new(&provider);
@@ -416,6 +406,41 @@ impl SendTxArgs {
             .await
         }
     }
+}
+
+fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -> Result<()> {
+    if let Some(from) = cli_from
+        && from != quantum_sender
+    {
+        eyre::bail!(
+            "--from must match --quantum.sender when using the Quantum adapter path"
+        )
+    }
+
+    Ok(())
+}
+
+fn quantum_send_requests_bootstrap(to: Option<&NameOrAddress>, input: Option<&str>) -> bool {
+    quantum_destination_is_keyvault(to) && quantum_input_is_bootstrap(input)
+}
+
+fn quantum_destination_is_keyvault(to: Option<&NameOrAddress>) -> bool {
+    match to {
+        Some(NameOrAddress::Address(addr)) => *addr == QUANTUM_KEYVAULT_ADDRESS,
+        Some(NameOrAddress::Name(name)) => {
+            Address::from_str(name).ok() == Some(QUANTUM_KEYVAULT_ADDRESS)
+        }
+        None => false,
+    }
+}
+
+fn quantum_input_is_bootstrap(input: Option<&str>) -> bool {
+    let Some(input) = input else { return false };
+    input.starts_with("bootstrapKey(")
+        || input
+            .trim()
+            .trim_start_matches("0x")
+            .starts_with(&hex::encode(QUANTUM_BOOTSTRAP_SELECTOR))
 }
 
 pub(crate) async fn cast_send<N: Network, P: Provider<N>>(

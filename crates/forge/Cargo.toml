@@ -51,6 +51,7 @@ forge-sol-macro-gen.workspace = true
 foundry-cli.workspace = true
 foundry-debugger.workspace = true
 foundry-wallets.workspace = true
+foundry-primitives.workspace = true
 
 alloy-chains.workspace = true
 alloy-consensus.workspace = true

@@ -31,6 +31,7 @@ use foundry_common::{
     },
     shell, stdin,
 };
+use foundry_primitives::QuantumNetwork;
 use op_alloy_network::Optimism;
 use std::time::Instant;
 use tempo_alloy::TempoNetwork;
@@ -368,6 +369,13 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                             .block_raw(block.unwrap_or(BlockId::Number(Latest)), full)
                             .await?
                     }
+                    Some(NetworkVariant::Quantum) => {
+                        let provider =
+                            ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
+                        Cast::new(&provider)
+                            .block_raw(block.unwrap_or(BlockId::Number(Latest)), full)
+                            .await?
+                    }
                     // Ethereum (default) or no --raw flag
                     _ => {
                         let provider =
@@ -585,6 +593,13 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                         .transaction(tx_hash, from, nonce, field, is_raw, to_request)
                         .await?
                 }
+                Some(NetworkVariant::Quantum) => {
+                    let provider =
+                        ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
+                    Cast::new(&provider)
+                        .transaction(tx_hash, from, nonce, field, is_raw, to_request)
+                        .await?
+                }
                 // Ethereum (default) or no --raw flag
                 _ => {
                     let provider = utils::get_provider(&config)?;
@@ -798,6 +813,9 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 }
                 Some(NetworkVariant::Tempo) => {
                     SimpleCast::decode_raw_transaction::<TempoNetwork>(&tx)?
+                }
+                Some(NetworkVariant::Quantum) => {
+                    SimpleCast::decode_raw_transaction::<QuantumNetwork>(&tx)?
                 }
                 _ => SimpleCast::decode_raw_transaction::<Ethereum>(&tx)?,
             };
