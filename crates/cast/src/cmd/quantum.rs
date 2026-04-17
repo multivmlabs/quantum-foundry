@@ -276,6 +276,17 @@ async fn submit_lifecycle(
         }
         Some(_) => {}
     }
+    match common.tx.quantum.key_id {
+        None => common.tx.quantum.key_id = Some(common.auth_key_id),
+        Some(quantum_key_id) if quantum_key_id != common.auth_key_id => {
+            return Err(eyre!(
+                "--auth-key-id and --quantum.key-id must match; got {} and {}",
+                common.auth_key_id,
+                quantum_key_id,
+            ));
+        }
+        Some(_) => {}
+    }
     if common.tx.quantum.primary_seed_file.is_none() {
         common.tx.quantum.primary_seed_file = Some(common.primary_seed_file.clone());
     }
@@ -286,7 +297,11 @@ async fn submit_lifecycle(
     }
 
     let primary_seed = parse_seed_file(&common.primary_seed_file)?;
+    // Read the merged cosigner path so `--quantum.cosigner-artifact` and
+    // `--cosigner-artifact` are both honored consistently.
     let cosigner = common
+        .tx
+        .quantum
         .cosigner_artifact
         .as_deref()
         .map(DetachedCosigner::from_artifact_file)

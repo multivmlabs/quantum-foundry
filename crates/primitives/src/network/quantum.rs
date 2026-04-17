@@ -381,13 +381,16 @@ fn encode_empty_list(out: &mut dyn BufMut) {
 
 fn encode_optional_list_bytes(value: Option<&Bytes>, out: &mut dyn BufMut) {
     match value {
-        Some(value) => value.as_ref().encode(out),
+        // Preserve the raw RLP list framing produced by `decode_list_bytes`.
+        // `<[u8] as Encodable>::encode` would re-wrap with a string header and
+        // break decode→encode idempotence (changes tx hash).
+        Some(value) => out.put_slice(value.as_ref()),
         None => encode_empty_list(out),
     }
 }
 
 fn optional_list_bytes_length(value: Option<&Bytes>) -> usize {
-    value.map_or(1, Encodable::length)
+    value.map_or(1, |v| v.len())
 }
 
 fn decode_optional_list_bytes(buf: &mut &[u8]) -> alloy_rlp::Result<Option<Bytes>> {

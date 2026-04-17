@@ -450,13 +450,17 @@ fn quantum_destination_is_keyvault(to: Option<&NameOrAddress>) -> bool {
     }
 }
 
+fn strip_hex_prefix(value: &str) -> &str {
+    value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value)
+}
+
 fn quantum_input_is_bootstrap(input: Option<&str>) -> bool {
     let Some(input) = input else { return false };
-    input.starts_with("bootstrapKey(")
-        || input
-            .trim()
-            .trim_start_matches("0x")
-            .starts_with(&hex::encode(QUANTUM_BOOTSTRAP_SELECTOR))
+    if input.starts_with("bootstrapKey(") {
+        return true;
+    }
+    let hex_body = strip_hex_prefix(input.trim()).to_ascii_lowercase();
+    hex_body.starts_with(&hex::encode(QUANTUM_BOOTSTRAP_SELECTOR))
 }
 
 fn quantum_input_is_unsupported_lifecycle(input: Option<&str>) -> bool {
@@ -468,7 +472,7 @@ fn quantum_input_is_unsupported_lifecycle(input: Option<&str>) -> bool {
     {
         return true;
     }
-    let hex_body = trimmed.trim_start_matches("0x").to_ascii_lowercase();
+    let hex_body = strip_hex_prefix(trimmed).to_ascii_lowercase();
     let add = hex::encode(QUANTUM_ADD_KEY_SELECTOR);
     let remove = hex::encode(QUANTUM_REMOVE_KEY_SELECTOR);
     let update = hex::encode(QUANTUM_UPDATE_KEY_AUTH_SELECTOR);
