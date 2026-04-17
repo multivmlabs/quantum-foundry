@@ -1,6 +1,18 @@
 <br>
 <br>
 
+<p align="center">
+  <a href="https://quantum.systems">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://quantum.systems/images/logo-white.svg">
+      <img alt="tempo combomark" src="https://quantum.systems/images/logo-white.svg" width="auto" height="120">
+    </picture>
+  </a>
+</p>
+
+<br>
+<br>
+
 # Quantum Foundry
 
 Quantum is a post-quantum-ready EVM execution environment with a dedicated native transaction type (`0x7A`), explicit account lanes, and an ML-DSA-44 primary signer with optional detached classical cosigners.
