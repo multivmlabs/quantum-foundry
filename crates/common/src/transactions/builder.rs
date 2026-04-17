@@ -466,6 +466,14 @@ impl QuantumWriteRequestV1 {
             );
         }
 
+        if self.is_bootstrap_call() {
+            ensure!(
+                self.key_id == 0,
+                "Quantum bootstrap requests must use key_id = 0 (account-lane primary); got key_id = {}",
+                self.key_id
+            );
+        }
+
         Ok(())
     }
 
@@ -984,6 +992,34 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "Quantum bootstrap remains primary-only in v1");
+    }
+
+    #[test]
+    fn quantum_request_rejects_bootstrap_with_nonzero_key_id() {
+        let bootstrap_tx = TransactionRequest::default()
+            .with_to(QUANTUM_KEYVAULT_ADDRESS)
+            .with_nonce(0)
+            .with_gas_limit(21_000)
+            .with_max_fee_per_gas(1_000_000_000u128)
+            .with_max_priority_fee_per_gas(1_000_000u128)
+            .with_input(Bytes::from(QUANTUM_BOOTSTRAP_SELECTOR.to_vec()))
+            .with_chain_id(1337);
+
+        let err = QuantumWriteRequestV1::from_transaction_request(
+            &bootstrap_tx,
+            QuantumWriteRequestInputsV1 {
+                sender: Address::repeat_byte(0x11),
+                key_id: 7,
+                nonce_key: None,
+                bootstrap: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Quantum bootstrap requests must use key_id = 0 (account-lane primary); got key_id = 7"
+        );
     }
 
     #[test]

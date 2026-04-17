@@ -16,10 +16,10 @@ use foundry_cli::{
     utils::{LoadConfig, find_contract_artifacts, read_constructor_args_file},
 };
 use foundry_common::{
-    FoundryTransactionBuilder,
+    DetachedCosigner, FoundryTransactionBuilder,
     compile::{self},
     fmt::parse_tokens,
-    parse_seed_file, sign_quantum_transaction_request,
+    parse_seed_file, sign_quantum_transaction_request_with_cosigner,
     provider::ProviderBuilder,
     shell,
 };
@@ -145,6 +145,14 @@ impl CreateArgs {
             self.tx.quantum.primary_seed_file.as_deref().map(parse_seed_file).transpose()?
         };
 
+        let cosigner = self
+            .tx
+            .quantum
+            .cosigner_artifact
+            .as_deref()
+            .map(DetachedCosigner::from_artifact_file)
+            .transpose()?;
+
         let mut config = self.load_config()?;
 
         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
@@ -211,6 +219,7 @@ impl CreateArgs {
             id,
             dry_run,
             primary_seed,
+            cosigner,
         )
         .await
     }
@@ -653,6 +662,7 @@ impl CreateArgs {
         id: ArtifactId,
         dry_run: bool,
         primary_seed: Option<[u8; 32]>,
+        cosigner: Option<DetachedCosigner>,
     ) -> Result<()> {
         let bin = bin.into_bytes().unwrap_or_default();
         if bin.is_empty() {
@@ -763,7 +773,11 @@ impl CreateArgs {
             eyre!("--quantum.primary-seed-file is required for Quantum writes")
         })?;
 
-        let raw_tx = sign_quantum_transaction_request(deployer.tx.clone(), primary_seed)?;
+        let raw_tx = sign_quantum_transaction_request_with_cosigner(
+            deployer.tx.clone(),
+            primary_seed,
+            cosigner,
+        )?;
         let receipt = provider
             .send_raw_transaction(&raw_tx.raw_transaction)
             .await?

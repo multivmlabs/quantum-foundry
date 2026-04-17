@@ -58,6 +58,17 @@ pub struct QuantumOpts {
         value_name = "HEX_BYTES"
     )]
     pub init_cosigner_pubkey: Option<Bytes>,
+
+    /// Path to a v1 detached cosigner artifact JSON.
+    ///
+    /// The artifact must carry a matching `signing_hash` for the Quantum request being signed.
+    /// Supported schemes are `p256` and `ecdsa`.
+    #[arg(
+        id = "quantum_cosigner_artifact",
+        long = "quantum.cosigner-artifact",
+        value_name = "PATH"
+    )]
+    pub cosigner_artifact: Option<PathBuf>,
 }
 
 impl QuantumOpts {
@@ -69,6 +80,7 @@ impl QuantumOpts {
             || self.primary_seed_file.is_some()
             || self.init_primary_pubkey.is_some()
             || self.init_cosigner_pubkey.is_some()
+            || self.cosigner_artifact.is_some()
     }
 
     /// Returns the resolved key ID for the Phase 0 seam.
@@ -123,6 +135,8 @@ mod tests {
             "0x010203",
             "--quantum.init-cosigner-pubkey",
             "0x0405",
+            "--quantum.cosigner-artifact",
+            "./cosigner.json",
         ])
         .unwrap();
 
@@ -131,5 +145,6 @@ mod tests {
         assert_eq!(opts.primary_seed_file.as_deref(), Some(std::path::Path::new("./seed.hex")));
         assert_eq!(opts.init_primary_pubkey, Some(Bytes::from(vec![0x01, 0x02, 0x03])));
         assert_eq!(opts.init_cosigner_pubkey, Some(Bytes::from(vec![0x04, 0x05])));
+        assert_eq!(opts.cosigner_artifact.as_deref(), Some(std::path::Path::new("./cosigner.json")));
     }
 }

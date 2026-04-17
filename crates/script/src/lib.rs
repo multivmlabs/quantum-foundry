@@ -132,6 +132,15 @@ pub struct ScriptArgs {
     #[arg(long)]
     pub batch: bool,
 
+    /// Explicit Quantum adapter selection for script broadcast.
+    ///
+    /// The Quantum script broadcast path rejects all script-emitted transactions fail-closed in
+    /// v1 because the shared native-`0x7A` adapter does not yet carry a Quantum-aware
+    /// `forge script` pipeline. Use `cast send --quantum` or `forge create --quantum` for the
+    /// supported write surfaces.
+    #[arg(long = "quantum")]
+    pub quantum: bool,
+
     /// Number of calls per Tempo batch transaction.
     ///
     /// When `--batch` is enabled, splits the collected calls into multiple batch
@@ -298,6 +307,18 @@ impl ScriptArgs {
     #[allow(clippy::large_stack_frames)]
     pub async fn run_script(self) -> Result<()> {
         trace!(target: "script", "executing script command");
+
+        if self.quantum {
+            eyre::bail!(
+                "forge script --broadcast does not yet support the Quantum adapter path in v1.\n\
+                 Every script-emitted Quantum transaction requires the native `0x7A` single-call \
+                 envelope, and the shared signing/broadcast pipeline needed for that is only wired \
+                 through `cast send --quantum` and `forge create --quantum`.\n\
+                 Until the Quantum script pipeline is shipped, split scripted write flows into \
+                 individual `cast send --quantum` and `forge create --quantum` invocations, or rerun \
+                 without `--quantum` against an Ethereum-compatible network."
+            );
+        }
 
         let (config, evm_opts) = self.resolved_evm_opts().await?;
 
