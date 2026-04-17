@@ -572,6 +572,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         }
         CastSubcommand::Run(cmd) => cmd.run().await?,
         CastSubcommand::SendTx(cmd) => cmd.run().await?,
+        CastSubcommand::Quantum(cmd) => cmd.run().await?,
         CastSubcommand::BatchMakeTx(cmd) => cmd.run().await?,
         CastSubcommand::BatchSend(cmd) => cmd.run().await?,
         CastSubcommand::Tx { tx_hash, from, nonce, field, raw, rpc, to_request, network } => {

@@ -20,10 +20,10 @@ use foundry_cli::{
     utils::{LoadConfig, TraceResult, parse_ether_value},
 };
 use foundry_common::{
-    FoundryTransactionBuilder,
+    FoundryTransactionBuilder, QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE,
     abi::{encode_function_args, get_func},
     provider::{ProviderBuilder, curl_transport::generate_curl_command},
-    sh_println, shell,
+    quantum_call_is_unsupported_lifecycle_calldata, sh_println, shell,
 };
 use foundry_compilers::artifacts::EvmVersion;
 use foundry_config::{
@@ -221,6 +221,11 @@ impl CallArgs {
         if self.rpc.curl {
             return self.run_curl().await;
         }
+        // `cast call` is a read path and must stay on ordinary RPC simulation.
+        // Quantum write-only options (`--quantum*`) and KeyVault lifecycle
+        // selectors cannot be simulated; reject them with an actionable error
+        // instead of letting them reach `eth_call`.
+        self.reject_quantum_read_path_misuse()?;
         if self.tx.tempo.is_tempo() {
             self.run_with_network::<TempoEvmNetwork>().await
         } else {
@@ -482,6 +487,51 @@ impl CallArgs {
 
         sh_println!("{}", curl_cmd)?;
         Ok(())
+    }
+
+    /// Fail closed when `cast call` is invoked with Quantum write-only options or
+    /// against a KeyVault lifecycle selector.
+    fn reject_quantum_read_path_misuse(&self) -> Result<()> {
+        if self.tx.quantum.is_quantum() {
+            eyre::bail!(
+                "`cast call` does not support Quantum write-only flags (--quantum*); use `cast call` without them for reads, or `cast quantum` / `cast send --quantum` for writes"
+            );
+        }
+        let calldata = self.read_path_calldata()?;
+        if let Some(bytes) = calldata
+            && quantum_call_is_unsupported_lifecycle_calldata(&bytes)
+        {
+            eyre::bail!(QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE);
+        }
+        Ok(())
+    }
+
+    /// Decode the `--data`/`sig` input for read-path selector checks. Returns
+    /// `None` when no call input is provided.
+    fn read_path_calldata(&self) -> Result<Option<Vec<u8>>> {
+        if let Some(data) = &self.data {
+            let trimmed = data.trim().trim_start_matches("0x");
+            return Ok(Some(hex::decode(trimmed)?));
+        }
+        if let Some(sig) = &self.sig {
+            let trimmed = sig.trim();
+            if let Some(hex_body) = trimmed.strip_prefix("0x").or_else(|| {
+                // Some callers pass a bare hex string without `0x`; treat short
+                // inputs that start with a known selector as already-encoded.
+                if trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                    Some(trimmed)
+                } else {
+                    None
+                }
+            }) && let Ok(bytes) = hex::decode(hex_body)
+            {
+                return Ok(Some(bytes));
+            }
+            if let Ok(func) = get_func(trimmed) {
+                return Ok(Some(encode_function_args(&func, &self.args)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Parse state overrides from command line arguments.
@@ -795,6 +845,62 @@ mod tests {
         assert!(args.trace);
         assert!(args.debug);
         assert_eq!(args.args, vec!["-999999"]);
+    }
+
+    #[test]
+    fn cast_call_rejects_keyvault_bootstrap_selector() {
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "0x0000000000000000000000000000000000001000",
+            "--data",
+            "0x5e8e7a13",
+        ]);
+        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be simulated via eth_call"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cast_call_rejects_keyvault_add_key_selector_via_sig() {
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "0x0000000000000000000000000000000000001000",
+            "0x32bc2919",
+        ]);
+        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be simulated via eth_call"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cast_call_rejects_quantum_write_flags() {
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "--quantum",
+            "0xDeaDBeeFcAfEbAbEfAcEfEeDcBaDbEeFcAfEbAbE",
+            "balanceOf(address)",
+            "0x000000000000000000000000000000000000dEaD",
+        ]);
+        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        assert!(
+            err.to_string().contains("does not support Quantum write-only flags"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn cast_call_allows_ordinary_view_call() {
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "0xDeaDBeeFcAfEbAbEfAcEfEeDcBaDbEeFcAfEbAbE",
+            "balanceOf(address)",
+            "0x000000000000000000000000000000000000dEaD",
+        ]);
+        args.reject_quantum_read_path_misuse().expect("ordinary reads must not be rejected");
     }
 
     #[test]

@@ -32,6 +32,11 @@ pub const QUANTUM_REMOVE_KEY_SELECTOR: [u8; 4] = [0xc9, 0x8f, 0x21, 0xf4];
 pub const QUANTUM_UPDATE_KEY_AUTH_SELECTOR: [u8; 4] = [0x89, 0x08, 0x15, 0x4b];
 pub const QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE: &str =
     "KeyVault lifecycle operations beyond bootstrapKey() require explicit lifecycle transaction submission";
+/// Stable rejection message surfaced when a caller tries to simulate a KeyVault
+/// lifecycle selector through `cast call` / `eth_call`. Matches the Phase 0 frozen
+/// contract in `docs/dev/quantum-phase0-implementation-note.md`.
+pub const QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE: &str =
+    "KeyVault lifecycle operations (bootstrap/addKey/removeKey/updateKeyAuth) cannot be simulated via eth_call; use explicit lifecycle transaction submission";
 
 /// Fixed gas limit for Quantum KeyVault bootstrap and lifecycle transactions.
 ///
@@ -46,6 +51,26 @@ pub const QUANTUM_SEND_UNSUPPORTED_LIFECYCLE_SELECTORS: [[u8; 4]; 3] = [
     QUANTUM_REMOVE_KEY_SELECTOR,
     QUANTUM_UPDATE_KEY_AUTH_SELECTOR,
 ];
+
+/// All KeyVault lifecycle selectors that are unsupported through `cast call` /
+/// `eth_call`. `bootstrapKey()` is included here because, unlike ordinary sends,
+/// bootstrap can never be simulated from the read path.
+pub const QUANTUM_CALL_UNSUPPORTED_LIFECYCLE_SELECTORS: [[u8; 4]; 4] = [
+    QUANTUM_BOOTSTRAP_SELECTOR,
+    QUANTUM_ADD_KEY_SELECTOR,
+    QUANTUM_REMOVE_KEY_SELECTOR,
+    QUANTUM_UPDATE_KEY_AUTH_SELECTOR,
+];
+
+/// Returns `true` if the given calldata targets a KeyVault lifecycle selector
+/// that must not be simulated through `cast call` / `eth_call`.
+pub fn quantum_call_is_unsupported_lifecycle_calldata(input: &[u8]) -> bool {
+    if input.len() < 4 {
+        return false;
+    }
+    let selector = [input[0], input[1], input[2], input[3]];
+    QUANTUM_CALL_UNSUPPORTED_LIFECYCLE_SELECTORS.contains(&selector)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetachedArtifactV1 {
@@ -344,16 +369,7 @@ pub fn quantum_is_unsupported_lifecycle_calldata(input: &[u8]) -> bool {
 }
 
 fn validate_quantum_write_request(request: &QuantumWriteRequestV1) -> Result<()> {
-    request.validate_v1()?;
-
-    if let TxKind::Call(to) = request.call.kind
-        && to == QUANTUM_KEYVAULT_ADDRESS
-        && quantum_is_unsupported_lifecycle_calldata(&request.call.input)
-    {
-        bail!(QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE);
-    }
-
-    Ok(())
+    request.validate_v1()
 }
 
 impl QuantumSigned {
@@ -501,9 +517,13 @@ mod tests {
     }
 
     #[test]
-    fn quantum_payload_rejects_non_bootstrap_lifecycle_selectors() {
+    fn quantum_shared_signer_accepts_lifecycle_selectors_for_cast_quantum_path() {
+        // The shared signer must sign KeyVault lifecycle selectors — those are the
+        // legitimate payload of `cast quantum add-key / remove-key / update-key-auth`.
+        // CLI-surface policy (rejecting lifecycle selectors on `cast send`) is enforced
+        // at the `cast send` pre-build guard, not at the shared write-request validator.
         let seed = parse_seed_file(&fixture_seed_path()).unwrap();
-        let err = sign_quantum_write_request(
+        let payload = sign_quantum_write_request(
             QuantumWriteRequestV1 {
                 sender: Address::repeat_byte(0x22),
                 key_id: 0,
@@ -522,9 +542,10 @@ mod tests {
             },
             seed,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(err.to_string(), QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE);
+        assert_eq!(payload.sender, Address::repeat_byte(0x22));
+        assert_eq!(&payload.raw_transaction[0..1], &[QUANTUM_TX_TYPE_ID]);
     }
 
     #[test]

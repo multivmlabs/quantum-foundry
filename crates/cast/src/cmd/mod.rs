@@ -23,6 +23,7 @@ pub mod interface;
 pub mod keychain;
 pub mod logs;
 pub mod mktx;
+pub mod quantum;
 pub mod rpc;
 pub mod run;
 pub mod send;
