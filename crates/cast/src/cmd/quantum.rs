@@ -265,14 +265,16 @@ async fn submit_lifecycle(
     // Set the quantum sender on the shared TransactionOpts so the wallet glue
     // finds it. The sender is the account being mutated, on whose behalf the
     // ML-DSA signer produces the primary signature.
-    if common.tx.quantum.sender.is_none() {
-        common.tx.quantum.sender = Some(common.sender);
-    } else if common.tx.quantum.sender != Some(common.sender) {
-        return Err(eyre!(
-            "--sender and --quantum.sender must match; got {} and {}",
-            common.sender,
-            common.tx.quantum.sender.unwrap(),
-        ));
+    match common.tx.quantum.sender {
+        None => common.tx.quantum.sender = Some(common.sender),
+        Some(quantum_sender) if quantum_sender != common.sender => {
+            return Err(eyre!(
+                "--sender and --quantum.sender must match; got {} and {}",
+                common.sender,
+                quantum_sender,
+            ));
+        }
+        Some(_) => {}
     }
     if common.tx.quantum.primary_seed_file.is_none() {
         common.tx.quantum.primary_seed_file = Some(common.primary_seed_file.clone());
@@ -398,9 +400,7 @@ mod tests {
             "--target-key-id",
             "2",
         ]);
-        let QuantumSubcommand::RemoveKey(r) = args.command else {
-            panic!("expected remove-key")
-        };
+        let QuantumSubcommand::RemoveKey(r) = args.command else { panic!("expected remove-key") };
         assert_eq!(r.target_key_id, 2);
     }
 

@@ -518,11 +518,8 @@ impl CallArgs {
             if let Some(hex_body) = trimmed.strip_prefix("0x").or_else(|| {
                 // Some callers pass a bare hex string without `0x`; treat short
                 // inputs that start with a known selector as already-encoded.
-                if trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                    Some(trimmed)
-                } else {
-                    None
-                }
+                (trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
+                    .then_some(trimmed)
             }) && let Ok(bytes) = hex::decode(hex_body)
             {
                 return Ok(Some(bytes));

@@ -73,7 +73,7 @@ pub struct QuantumOpts {
 
 impl QuantumOpts {
     /// Returns `true` if any Quantum-specific option is set.
-    pub fn is_quantum(&self) -> bool {
+    pub const fn is_quantum(&self) -> bool {
         self.enabled
             || self.sender.is_some()
             || self.key_id.is_some()
@@ -145,6 +145,9 @@ mod tests {
         assert_eq!(opts.primary_seed_file.as_deref(), Some(std::path::Path::new("./seed.hex")));
         assert_eq!(opts.init_primary_pubkey, Some(Bytes::from(vec![0x01, 0x02, 0x03])));
         assert_eq!(opts.init_cosigner_pubkey, Some(Bytes::from(vec![0x04, 0x05])));
-        assert_eq!(opts.cosigner_artifact.as_deref(), Some(std::path::Path::new("./cosigner.json")));
+        assert_eq!(
+            opts.cosigner_artifact.as_deref(),
+            Some(std::path::Path::new("./cosigner.json"))
+        );
     }
 }

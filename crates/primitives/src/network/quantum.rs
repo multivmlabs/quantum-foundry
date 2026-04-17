@@ -48,7 +48,7 @@ impl Typed2718 for QuantumTxType {
 
 impl From<QuantumTxType> for u8 {
     fn from(value: QuantumTxType) -> Self {
-        value as u8
+        value as Self
     }
 }
 
@@ -114,8 +114,8 @@ impl From<QuantumTxEnvelope> for QuantumTransactionRequest {
             sender: Some(value.sender),
             key_id: Some(value.key_id),
             nonce_key: Some(value.nonce_key),
-            init_primary_pubkey: value.init_primary_pubkey.clone(),
-            init_cosigner_pubkey: value.init_cosigner_pubkey.clone(),
+            init_primary_pubkey: value.init_primary_pubkey,
+            init_cosigner_pubkey: value.init_cosigner_pubkey,
         }
     }
 }
@@ -462,19 +462,20 @@ struct QuantumTxEnvelopeSerde {
 }
 
 impl QuantumTxEnvelope {
-    pub fn sender(&self) -> Address {
+    pub const fn sender(&self) -> Address {
         self.sender
     }
 
-    pub fn key_id(&self) -> u32 {
+    pub const fn key_id(&self) -> u32 {
         self.key_id
     }
 
-    pub fn nonce_key(&self) -> U256 {
+    pub const fn nonce_key(&self) -> U256 {
         self.nonce_key
     }
 
-    pub fn from_signed_parts(
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_signed_parts(
         chain_id: ChainId,
         sender: Address,
         nonce_key: U256,
@@ -1029,13 +1030,14 @@ impl RecommendedFillers for QuantumNetwork {
 
 #[cfg(test)]
 mod tests {
+    use alloy_network::ReceiptResponse as _;
     use alloy_provider::network::eip2718::Decodable2718 as _;
 
     use super::*;
 
     fn raw_fixture() -> serde_json::Value {
         serde_json::from_str(include_str!(
-            "../../../testdata/fixtures/quantum/phase0/raw-send-primary.json"
+            "../../../../testdata/fixtures/quantum/phase0/raw-send-primary.json"
         ))
         .unwrap()
     }
@@ -1048,7 +1050,8 @@ mod tests {
         let tx = QuantumTxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
 
         assert_eq!(tx.ty(), QUANTUM_TX_TYPE_ID);
-        assert_eq!(tx.sender(), value["sender"].as_str().unwrap().parse().unwrap());
+        let expected_sender: Address = value["sender"].as_str().unwrap().parse().unwrap();
+        assert_eq!(tx.sender(), expected_sender);
         assert_eq!(tx.key_id(), value["key_id"].as_u64().unwrap() as u32);
         assert_eq!(tx.nonce_key(), U256::ZERO);
     }

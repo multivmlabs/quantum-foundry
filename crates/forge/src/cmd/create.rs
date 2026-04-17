@@ -19,9 +19,9 @@ use foundry_common::{
     DetachedCosigner, FoundryTransactionBuilder,
     compile::{self},
     fmt::parse_tokens,
-    parse_seed_file, sign_quantum_transaction_request_with_cosigner,
+    parse_seed_file,
     provider::ProviderBuilder,
-    shell,
+    shell, sign_quantum_transaction_request_with_cosigner,
 };
 use foundry_compilers::{
     ArtifactId, artifacts::BytecodeObject, info::ContractInfo, utils::canonicalize,
@@ -769,9 +769,8 @@ impl CreateArgs {
             return Ok(());
         }
 
-        let primary_seed = primary_seed.ok_or_else(|| {
-            eyre!("--quantum.primary-seed-file is required for Quantum writes")
-        })?;
+        let primary_seed = primary_seed
+            .ok_or_else(|| eyre!("--quantum.primary-seed-file is required for Quantum writes"))?;
 
         let raw_tx = sign_quantum_transaction_request_with_cosigner(
             deployer.tx.clone(),
@@ -793,7 +792,8 @@ impl CreateArgs {
             ));
         }
 
-        let address = receipt.contract_address().ok_or_else(|| eyre!("contract was not deployed"))?;
+        let address =
+            receipt.contract_address().ok_or_else(|| eyre!("contract was not deployed"))?;
         let tx_hash = receipt.transaction_hash();
 
         if shell::is_json() {
@@ -886,9 +886,7 @@ fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -
     if let Some(from) = cli_from
         && from != quantum_sender
     {
-        eyre::bail!(
-            "--from must match --quantum.sender when using the Quantum adapter path"
-        )
+        eyre::bail!("--from must match --quantum.sender when using the Quantum adapter path")
     }
 
     Ok(())

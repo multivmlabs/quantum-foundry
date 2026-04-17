@@ -145,8 +145,7 @@ mod tests {
             scope_data: Bytes::from_static(&[0xcc; 8]),
         };
         let calldata = encode_add_key_calldata(&inputs);
-        let decoded =
-            KeyVaultLifecycle::addKeyCall::abi_decode_raw(&calldata[4..]).unwrap();
+        let decoded = KeyVaultLifecycle::addKeyCall::abi_decode_raw(&calldata[4..]).unwrap();
         assert_eq!(decoded.keyId, inputs.target_key_id);
         assert_eq!(decoded.pubkey.as_ref(), inputs.pubkey.as_ref());
         assert_eq!(decoded.scheme, inputs.scheme);

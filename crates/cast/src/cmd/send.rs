@@ -13,10 +13,11 @@ use foundry_common::{
     DetachedCosigner, FoundryTransactionBuilder, QUANTUM_ADD_KEY_SELECTOR,
     QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS, QUANTUM_LIFECYCLE_GAS_FLOOR,
     QUANTUM_REMOVE_KEY_SELECTOR, QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE,
-    QUANTUM_UPDATE_KEY_AUTH_SELECTOR, derive_primary_pubkey, parse_seed_file,
-    sign_quantum_transaction_request_with_cosigner,
+    QUANTUM_UPDATE_KEY_AUTH_SELECTOR, derive_primary_pubkey,
     fmt::{UIfmt, UIfmtReceiptExt},
+    parse_seed_file,
     provider::ProviderBuilder,
+    sign_quantum_transaction_request_with_cosigner,
 };
 use foundry_primitives::QuantumNetwork;
 use foundry_wallets::{TempoAccessKeyConfig, WalletSigner};
@@ -113,18 +114,8 @@ impl SendTxArgs {
     }
 
     async fn run_quantum(self) -> Result<()> {
-        let Self {
-            to,
-            mut sig,
-            args,
-            data,
-            send_tx,
-            command,
-            unlocked,
-            force: _,
-            mut tx,
-            path,
-        } = self;
+        let Self { to, mut sig, args, data, send_tx, command, unlocked, force: _, mut tx, path } =
+            self;
 
         if unlocked {
             return Err(eyre!("the Quantum adapter path does not support --unlocked"));
@@ -200,11 +191,8 @@ impl SendTxArgs {
             .await?;
 
         let (tx_request, _) = builder.build(sender).await?;
-        let payload = sign_quantum_transaction_request_with_cosigner(
-            tx_request,
-            primary_seed,
-            cosigner,
-        )?;
+        let payload =
+            sign_quantum_transaction_request_with_cosigner(tx_request, primary_seed, cosigner)?;
 
         let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
         let cast = CastTxSender::new(&provider);
@@ -442,9 +430,7 @@ fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -
     if let Some(from) = cli_from
         && from != quantum_sender
     {
-        eyre::bail!(
-            "--from must match --quantum.sender when using the Quantum adapter path"
-        )
+        eyre::bail!("--from must match --quantum.sender when using the Quantum adapter path")
     }
 
     Ok(())
