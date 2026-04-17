@@ -183,7 +183,10 @@ impl QuantumArgs {
 
 async fn run_bootstrap(args: BootstrapArgs) -> Result<()> {
     let BootstrapArgs { mut common } = args;
-    if common.cosigner_artifact.is_some() {
+    // v1 bootstrap is primary-only: reject cosigner supplied via either the
+    // lifecycle-specific `--cosigner-artifact` or the shared
+    // `--quantum.cosigner-artifact` flag.
+    if common.cosigner_artifact.is_some() || common.tx.quantum.cosigner_artifact.is_some() {
         return Err(eyre!(
             "Quantum v1 bootstrap is primary-only; cosigner artifact is not supported"
         ));

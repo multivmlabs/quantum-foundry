@@ -51,9 +51,11 @@ jobs:
         run: cargo test -p foundry-common -p foundry-primitives -p foundry-cli
 
       # Targeted Quantum regression: pinned golden fixture and composite RLP envelope.
+      # Multiple filters must follow `--` (cargo test accepts only a single
+      # positional TESTNAME before `--`; libtest then applies all post-`--`
+      # filters as an OR under `--exact`).
       - name: Quantum fixture regression
         run: |
-          cargo test -p foundry-common --lib \
+          cargo test -p foundry-common --lib -- --exact \
             transactions::quantum::tests::generated_fixture_matches_checked_in_phase0_example \
-            transactions::quantum::tests::detached_p256_cosigner_is_attached_to_composite_signature \
-            -- --exact
+            transactions::quantum::tests::detached_p256_cosigner_is_attached_to_composite_signature
