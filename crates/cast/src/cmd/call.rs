@@ -223,8 +223,9 @@ impl CallArgs {
         // instead of letting them reach `eth_call`. Run the guard before the
         // `--curl` branch so curl-mode emission cannot bypass the fail-closed
         // policy. The guard is pure local validation and does not contact the
-        // provider.
-        self.reject_quantum_read_path_misuse()?;
+        // provider. Name/ENS destinations are re-checked against their resolved
+        // address later in `run_with_network`; `run_curl` rejects names outright.
+        self.reject_quantum_read_path_misuse(None)?;
         // Handle --curl mode early, before any provider interaction
         if self.rpc.curl {
             return self.run_curl().await;
@@ -254,8 +255,20 @@ impl CallArgs {
         let state_overrides = self.get_state_overrides()?;
         let block_overrides = self.get_block_overrides()?;
 
+        let provider = ProviderBuilder::<FEN::Network>::from_config(&config)?.build()?;
+
+        // Resolve the destination up front so the lifecycle fence observes the
+        // true address, not an unresolved name/ENS target that happens to map
+        // to `QUANTUM_KEYVAULT_ADDRESS`. Without this, a name resolving to the
+        // KeyVault would bypass the fail-closed check and reach `eth_call`.
+        let resolved_to = match self.to.clone() {
+            Some(to) => Some(to.resolve(&provider).await?),
+            None => None,
+        };
+        self.reject_quantum_read_path_misuse(resolved_to)?;
+
         let Self {
-            to,
+            to: _,
             mut sig,
             mut args,
             mut tx,
@@ -277,7 +290,6 @@ impl CallArgs {
             sig = Some(data);
         }
 
-        let provider = ProviderBuilder::<FEN::Network>::from_config(&config)?.build()?;
         let sender = SenderKind::from_wallet_opts(wallet).await?;
         let from = sender.address();
 
@@ -300,7 +312,7 @@ impl CallArgs {
 
         let (tx, func) = CastTxBuilder::new(&provider, tx, &config)
             .await?
-            .with_to(to)
+            .with_to(resolved_to.map(NameOrAddress::Address))
             .await?
             .with_code_sig_and_args(code, sig, args)
             .await?
@@ -494,7 +506,13 @@ impl CallArgs {
 
     /// Fail closed when `cast call` is invoked with Quantum write-only options or
     /// against a KeyVault lifecycle selector.
-    fn reject_quantum_read_path_misuse(&self) -> Result<()> {
+    ///
+    /// `resolved_to` lets callers pass a post-name-resolution destination so a
+    /// name that resolves to `QUANTUM_KEYVAULT_ADDRESS` cannot bypass the
+    /// lifecycle fence by slipping through ENS/Etherscan lookup before
+    /// `eth_call`. When `None`, only literal-address forms of the destination
+    /// are checked (suitable for the early, pre-provider guard).
+    fn reject_quantum_read_path_misuse(&self, resolved_to: Option<Address>) -> Result<()> {
         if self.tx.quantum.is_quantum() {
             eyre::bail!(
                 "`cast call` does not support Quantum write-only flags (--quantum*); use `cast call` without them for reads, or `cast quantum` / `cast send --quantum` for writes"
@@ -502,10 +520,8 @@ impl CallArgs {
         }
         // Only reject KeyVault lifecycle selectors when the destination is the
         // KeyVault precompile. An unrelated contract with a colliding selector
-        // must not be blocked. ENS/name destinations are checked via their
-        // literal address form; a name that resolves to the KeyVault will fail
-        // naturally at `eth_call`, which is acceptable for the read path.
-        if !self.destination_is_keyvault() {
+        // must not be blocked.
+        if !self.destination_is_keyvault(resolved_to) {
             return Ok(());
         }
         // Bare function names (no parentheses, no hex) are resolved later via
@@ -526,7 +542,10 @@ impl CallArgs {
         Ok(())
     }
 
-    fn destination_is_keyvault(&self) -> bool {
+    fn destination_is_keyvault(&self, resolved_to: Option<Address>) -> bool {
+        if resolved_to == Some(QUANTUM_KEYVAULT_ADDRESS) {
+            return true;
+        }
         match self.to.as_ref() {
             Some(NameOrAddress::Address(addr)) => *addr == QUANTUM_KEYVAULT_ADDRESS,
             Some(NameOrAddress::Name(name)) => {
@@ -893,7 +912,7 @@ mod tests {
             "--data",
             "0x5e8e7a13",
         ]);
-        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        let err = args.reject_quantum_read_path_misuse(None).unwrap_err();
         assert!(
             err.to_string().contains("cannot be simulated via eth_call"),
             "unexpected error: {err}"
@@ -907,7 +926,7 @@ mod tests {
             "0x0000000000000000000000000000000000001000",
             "0x32bc2919",
         ]);
-        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        let err = args.reject_quantum_read_path_misuse(None).unwrap_err();
         assert!(
             err.to_string().contains("cannot be simulated via eth_call"),
             "unexpected error: {err}"
@@ -923,7 +942,7 @@ mod tests {
             "balanceOf(address)",
             "0x000000000000000000000000000000000000dEaD",
         ]);
-        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        let err = args.reject_quantum_read_path_misuse(None).unwrap_err();
         assert!(
             err.to_string().contains("does not support Quantum write-only flags"),
             "unexpected error: {err}"
@@ -938,7 +957,7 @@ mod tests {
             "balanceOf(address)",
             "0x000000000000000000000000000000000000dEaD",
         ]);
-        args.reject_quantum_read_path_misuse().expect("ordinary reads must not be rejected");
+        args.reject_quantum_read_path_misuse(None).expect("ordinary reads must not be rejected");
     }
 
     #[test]
@@ -952,8 +971,22 @@ mod tests {
             "--data",
             "0x32bc2919",
         ]);
-        args.reject_quantum_read_path_misuse()
+        args.reject_quantum_read_path_misuse(None)
             .expect("colliding selector on non-KeyVault destination must not be rejected");
+    }
+
+    #[test]
+    fn cast_call_rejects_resolved_keyvault_name_for_lifecycle_selector() {
+        // A name destination that resolves to QUANTUM_KEYVAULT_ADDRESS must be
+        // rejected when the caller passes the resolved address into the fence.
+        // This protects against name/ENS destinations bypassing the read-path
+        // guard and reaching `eth_call` with an unsupported lifecycle selector.
+        let args = CallArgs::parse_from(["foundry-cli", "keyvault.eth", "--data", "0x32bc2919"]);
+        let err = args.reject_quantum_read_path_misuse(Some(QUANTUM_KEYVAULT_ADDRESS)).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be simulated via eth_call"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

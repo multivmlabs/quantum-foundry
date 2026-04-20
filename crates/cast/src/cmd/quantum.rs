@@ -289,6 +289,29 @@ async fn submit_lifecycle(
         ));
     }
 
+    // `LifecycleCommonOpts` flattens the full `SendTxOpts`/`TransactionOpts`
+    // surfaces so every lifecycle subcommand shares the same RPC/wallet flags.
+    // Flags that the Quantum v1 envelope cannot carry must be rejected up
+    // front; otherwise the CLI advertises options that are silently dropped.
+    // Mirrors the guards in `cast send --quantum` (crates/cast/src/cmd/send.rs).
+    if common.send_tx.browser.browser {
+        return Err(eyre!("the Quantum lifecycle path does not support browser signing"));
+    }
+    if common.tx.tempo.is_tempo() {
+        return Err(eyre!("Quantum lifecycle and Tempo options cannot be combined"));
+    }
+    if common.tx.blob || common.tx.eip4844 || common.tx.blob_gas_price.is_some() {
+        return Err(eyre!("the Quantum lifecycle path does not support blob transactions"));
+    }
+    // Quantum signing requires EIP-1559 fee fields; reject the legacy-fee path
+    // up front instead of failing late in request construction. Mirrors
+    // `forge create --quantum` at crates/forge/src/cmd/create.rs.
+    if common.tx.legacy {
+        return Err(eyre!(
+            "the Quantum lifecycle path requires EIP-1559 fees; --legacy is not supported"
+        ));
+    }
+
     // Set the quantum sender on the shared TransactionOpts so the wallet glue
     // finds it. The sender is the account being mutated, on whose behalf the
     // ML-DSA signer produces the primary signature.
@@ -314,13 +337,34 @@ async fn submit_lifecycle(
         }
         Some(_) => {}
     }
-    if common.tx.quantum.primary_seed_file.is_none() {
-        common.tx.quantum.primary_seed_file = Some(common.primary_seed_file.clone());
+    // Lifecycle-specific flags and the shared `--quantum.*` forms set the same
+    // underlying signing material. Reject conflicting values explicitly rather
+    // than silently preferring one side — a divergence in signing inputs is
+    // almost always an operator mistake, and the two flag families had
+    // inconsistent precedence that could silently ignore either side.
+    match common.tx.quantum.primary_seed_file.as_ref() {
+        None => common.tx.quantum.primary_seed_file = Some(common.primary_seed_file.clone()),
+        Some(quantum_seed) if quantum_seed != &common.primary_seed_file => {
+            return Err(eyre!(
+                "--primary-seed-file and --quantum.primary-seed-file must match; got {} and {}",
+                common.primary_seed_file.display(),
+                quantum_seed.display(),
+            ));
+        }
+        Some(_) => {}
     }
-    if common.tx.quantum.cosigner_artifact.is_none()
-        && let Some(ref p) = common.cosigner_artifact
-    {
-        common.tx.quantum.cosigner_artifact = Some(p.clone());
+    match (common.cosigner_artifact.as_ref(), common.tx.quantum.cosigner_artifact.as_ref()) {
+        (Some(lifecycle), None) => {
+            common.tx.quantum.cosigner_artifact = Some(lifecycle.clone());
+        }
+        (Some(lifecycle), Some(quantum)) if lifecycle != quantum => {
+            return Err(eyre!(
+                "--cosigner-artifact and --quantum.cosigner-artifact must match; got {} and {}",
+                lifecycle.display(),
+                quantum.display(),
+            ));
+        }
+        _ => {}
     }
 
     // The `cast quantum` help contract says value is ignored for KeyVault

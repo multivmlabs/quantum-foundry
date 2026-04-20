@@ -132,6 +132,14 @@ impl SendTxArgs {
         if path.is_some() {
             return Err(eyre!("the Quantum adapter path does not support blob data"));
         }
+        // Quantum signing requires EIP-1559 fee fields; reject the legacy-fee
+        // path up front instead of failing late in request construction.
+        // Mirrors `forge create --quantum` at crates/forge/src/cmd/create.rs.
+        if tx.legacy {
+            return Err(eyre!(
+                "the Quantum adapter path requires EIP-1559 fees; --legacy is not supported"
+            ));
+        }
         if let Some(data) = data {
             sig = Some(data);
         }
