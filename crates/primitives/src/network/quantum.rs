@@ -887,12 +887,27 @@ impl Decodable2718 for QuantumTxEnvelope {
     }
 }
 
+// ML-DSA signatures are not recoverable the way secp256k1 is: verification
+// requires the sender's registered post-quantum pubkey, which lives in the
+// Quantum KeyVault on-chain state and is only reachable from the execution
+// node. The envelope therefore carries `sender` explicitly and signature
+// verification is performed at execution time by the node. These impls
+// return the declared sender — matching the upstream precedent for other
+// non-ECDSA envelopes such as `OpTxEnvelope::Deposit` — after a cheap
+// structural check that `sender_sig` is non-empty, which rejects trivially
+// malformed envelopes without pretending to do cryptographic verification.
 impl SignerRecoverable for QuantumTxEnvelope {
     fn recover_signer(&self) -> Result<Address, alloy_consensus::crypto::RecoveryError> {
+        if self.sender_sig.is_empty() {
+            return Err(alloy_consensus::crypto::RecoveryError::new());
+        }
         Ok(self.sender)
     }
 
     fn recover_signer_unchecked(&self) -> Result<Address, alloy_consensus::crypto::RecoveryError> {
+        if self.sender_sig.is_empty() {
+            return Err(alloy_consensus::crypto::RecoveryError::new());
+        }
         Ok(self.sender)
     }
 }
@@ -1116,6 +1131,35 @@ mod tests {
         assert_eq!(tx.sender(), expected_sender);
         assert_eq!(tx.key_id(), value["key_id"].as_u64().unwrap() as u32);
         assert_eq!(tx.nonce_key(), U256::ZERO);
+    }
+
+    #[test]
+    fn recover_signer_rejects_empty_sender_sig() {
+        // ML-DSA signatures are not recoverable, so `recover_signer` returns
+        // the declared sender — but it must refuse envelopes whose sender
+        // signature payload is structurally empty. Authoritative verification
+        // still happens at execution by the Quantum node via KeyVault state.
+        let envelope = QuantumTxEnvelope::from_signed_parts(
+            1337,
+            Address::repeat_byte(0x11),
+            U256::ZERO,
+            0,
+            0,
+            1,
+            1,
+            21_000,
+            TxKind::Call(Address::repeat_byte(0x22)),
+            U256::ZERO,
+            Bytes::new(),
+            AccessList::default(),
+            None,
+            None,
+            Bytes::new(),
+            None,
+        );
+
+        assert!(envelope.recover_signer().is_err());
+        assert!(envelope.recover_signer_unchecked().is_err());
     }
 
     #[test]
