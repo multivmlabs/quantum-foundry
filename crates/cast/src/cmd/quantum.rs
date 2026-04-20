@@ -299,6 +299,14 @@ async fn submit_lifecycle(
         common.tx.quantum.cosigner_artifact = Some(p.clone());
     }
 
+    // The `cast quantum` help contract says value is ignored for KeyVault
+    // lifecycle writes. Reject non-zero `--value` explicitly rather than
+    // silently zero it: forwarding ETH to `bootstrapKey()`/`addKey()`/etc. is
+    // almost always an operator mistake.
+    if common.tx.value.is_some_and(|v| !v.is_zero()) {
+        return Err(eyre!("KeyVault lifecycle writes do not accept `--value`; remove the flag"));
+    }
+
     let primary_seed = parse_seed_file(&common.primary_seed_file)?;
     // Read the merged cosigner path so `--quantum.cosigner-artifact` and
     // `--cosigner-artifact` are both honored consistently.

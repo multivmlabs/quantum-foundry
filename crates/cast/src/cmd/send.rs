@@ -147,6 +147,53 @@ impl SendTxArgs {
             })?;
         let primary_seed = parse_seed_file(seed_path)?;
 
+        // Quantum v1 does not carry EIP-7702 authorization lists in the signed
+        // envelope (`QuantumTxEnvelope::authorization_list()` returns `None`).
+        // Reject `--auth` explicitly so callers do not believe a 7702 auth is
+        // being broadcast when it would be silently dropped.
+        if !tx.auth.is_empty() {
+            return Err(eyre!(
+                "the Quantum adapter path does not support EIP-7702 `--auth`; the v1 envelope does not carry authorization lists"
+            ));
+        }
+
+        let config = send_tx.eth.load_config()?;
+        let provider = ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
+
+        if let Some(interval) = send_tx.poll_interval {
+            provider.client().set_poll_interval(Duration::from_secs(interval));
+        }
+
+        // Resolve the destination up front so the lifecycle fence and bootstrap
+        // gas-floor block observe the true destination address, not an
+        // unresolved name/ENS target. A name that resolves to the KeyVault
+        // would otherwise slip past the literal-address check below.
+        let resolved_to = match to {
+            Some(to) => Some(to.resolve(&provider).await?),
+            None => None,
+        };
+
+        // Fail closed before any RPC simulation: ordinary `cast send` must not accept
+        // unsupported KeyVault lifecycle selectors (addKey / removeKey / updateKeyAuth).
+        // Only `bootstrapKey()` is supported from this path in v1.
+        let destination_is_keyvault = resolved_to == Some(QUANTUM_KEYVAULT_ADDRESS);
+        if destination_is_keyvault && quantum_input_is_unsupported_lifecycle(sig.as_deref()) {
+            return Err(eyre!(QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE));
+        }
+
+        let is_bootstrap = destination_is_keyvault && quantum_input_is_bootstrap(sig.as_deref());
+
+        // v1 bootstrap is primary-only: `cast quantum bootstrap` rejects any
+        // cosigner artifact, and `cast send --quantum` must enforce the same
+        // invariant so both sanctioned entry points produce the same envelope
+        // shape. Cosigner attachment is a signature-side artifact, so this
+        // cannot be caught by `QuantumWriteRequestV1::validate_v1`.
+        if is_bootstrap && tx.quantum.cosigner_artifact.is_some() {
+            return Err(eyre!(
+                "Quantum v1 bootstrap is primary-only; cosigner artifact is not supported"
+            ));
+        }
+
         let cosigner = tx
             .quantum
             .cosigner_artifact
@@ -154,16 +201,7 @@ impl SendTxArgs {
             .map(DetachedCosigner::from_artifact_file)
             .transpose()?;
 
-        // Fail closed before any RPC simulation: ordinary `cast send` must not accept
-        // unsupported KeyVault lifecycle selectors (addKey / removeKey / updateKeyAuth).
-        // Only `bootstrapKey()` is supported from this path in v1.
-        if quantum_destination_is_keyvault(to.as_ref())
-            && quantum_input_is_unsupported_lifecycle(sig.as_deref())
-        {
-            return Err(eyre!(QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE));
-        }
-
-        if quantum_send_requests_bootstrap(to.as_ref(), sig.as_deref()) {
+        if is_bootstrap {
             if tx.quantum.init_primary_pubkey.is_none() {
                 tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
             }
@@ -176,16 +214,9 @@ impl SendTxArgs {
             }
         }
 
-        let config = send_tx.eth.load_config()?;
-        let provider = ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
-
-        if let Some(interval) = send_tx.poll_interval {
-            provider.client().set_poll_interval(Duration::from_secs(interval));
-        }
-
         let builder = CastTxBuilder::new(&provider, tx.clone(), &config)
             .await?
-            .with_to(to)
+            .with_to(resolved_to.map(NameOrAddress::Address))
             .await?
             .with_code_sig_and_args(None, sig, args)
             .await?;
@@ -434,20 +465,6 @@ fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -
     }
 
     Ok(())
-}
-
-fn quantum_send_requests_bootstrap(to: Option<&NameOrAddress>, input: Option<&str>) -> bool {
-    quantum_destination_is_keyvault(to) && quantum_input_is_bootstrap(input)
-}
-
-fn quantum_destination_is_keyvault(to: Option<&NameOrAddress>) -> bool {
-    match to {
-        Some(NameOrAddress::Address(addr)) => *addr == QUANTUM_KEYVAULT_ADDRESS,
-        Some(NameOrAddress::Name(name)) => {
-            Address::from_str(name).ok() == Some(QUANTUM_KEYVAULT_ADDRESS)
-        }
-        None => false,
-    }
 }
 
 fn strip_hex_prefix(value: &str) -> &str {

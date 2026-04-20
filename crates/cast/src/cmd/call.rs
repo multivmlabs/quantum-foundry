@@ -20,7 +20,7 @@ use foundry_cli::{
     utils::{LoadConfig, TraceResult, parse_ether_value},
 };
 use foundry_common::{
-    FoundryTransactionBuilder, QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE,
+    FoundryTransactionBuilder, QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE, QUANTUM_KEYVAULT_ADDRESS,
     abi::{encode_function_args, get_func},
     provider::{ProviderBuilder, curl_transport::generate_curl_command},
     quantum_call_is_unsupported_lifecycle_calldata, sh_println, shell,
@@ -497,6 +497,14 @@ impl CallArgs {
                 "`cast call` does not support Quantum write-only flags (--quantum*); use `cast call` without them for reads, or `cast quantum` / `cast send --quantum` for writes"
             );
         }
+        // Only reject KeyVault lifecycle selectors when the destination is the
+        // KeyVault precompile. An unrelated contract with a colliding selector
+        // must not be blocked. ENS/name destinations are checked via their
+        // literal address form; a name that resolves to the KeyVault will fail
+        // naturally at `eth_call`, which is acceptable for the read path.
+        if !self.destination_is_keyvault() {
+            return Ok(());
+        }
         let calldata = self.read_path_calldata()?;
         if let Some(bytes) = calldata
             && quantum_call_is_unsupported_lifecycle_calldata(&bytes)
@@ -504,6 +512,16 @@ impl CallArgs {
             eyre::bail!(QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE);
         }
         Ok(())
+    }
+
+    fn destination_is_keyvault(&self) -> bool {
+        match self.to.as_ref() {
+            Some(NameOrAddress::Address(addr)) => *addr == QUANTUM_KEYVAULT_ADDRESS,
+            Some(NameOrAddress::Name(name)) => {
+                Address::from_str(name).ok() == Some(QUANTUM_KEYVAULT_ADDRESS)
+            }
+            None => false,
+        }
     }
 
     /// Decode the `--data`/`sig` input for read-path selector checks. Returns
@@ -898,6 +916,21 @@ mod tests {
             "0x000000000000000000000000000000000000dEaD",
         ]);
         args.reject_quantum_read_path_misuse().expect("ordinary reads must not be rejected");
+    }
+
+    #[test]
+    fn cast_call_allows_colliding_selector_on_non_keyvault_destination() {
+        // Unrelated contract with a selector that happens to collide with a
+        // KeyVault lifecycle selector (0x32bc2919 = addKey) must NOT be
+        // rejected on the read path when `to` is not the KeyVault address.
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "0xDeaDBeeFcAfEbAbEfAcEfEeDcBaDbEeFcAfEbAbE",
+            "--data",
+            "0x32bc2919",
+        ]);
+        args.reject_quantum_read_path_misuse()
+            .expect("colliding selector on non-KeyVault destination must not be rejected");
     }
 
     #[test]
