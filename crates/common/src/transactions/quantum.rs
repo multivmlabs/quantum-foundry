@@ -254,8 +254,20 @@ pub fn sign_quantum_transaction_request_with_cosigner(
     primary_seed: [u8; ML_DSA_SEED_BYTES],
     cosigner: Option<DetachedCosigner>,
 ) -> Result<QuantumSignedPayload> {
-    if tx.init_primary_pubkey.is_none() && quantum_transaction_request_is_bootstrap(&tx) {
-        tx.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+    // For bootstrap writes, a caller-supplied `init_primary_pubkey` must match
+    // the key derived from the signing seed; otherwise the operator would
+    // initialize a key they cannot sign with. Auto-fill when omitted.
+    if quantum_transaction_request_is_bootstrap(&tx) {
+        let derived = derive_primary_pubkey(primary_seed);
+        match tx.init_primary_pubkey.as_ref() {
+            None => tx.init_primary_pubkey = Some(derived),
+            Some(provided) if provided != &derived => {
+                bail!(
+                    "Quantum bootstrap init_primary_pubkey does not match the public key derived from the signing seed"
+                );
+            }
+            Some(_) => {}
+        }
     }
 
     let request = QuantumWriteRequestV1::from_quantum_transaction_request(&tx)?;
@@ -559,6 +571,29 @@ mod tests {
 
         let payload = sign_quantum_transaction_request(request, seed).unwrap();
         assert_eq!(payload.sender, Address::repeat_byte(0x22));
+    }
+
+    #[test]
+    fn quantum_transaction_request_bootstrap_rejects_mismatched_primary_pubkey() {
+        let seed = parse_seed_file(&fixture_seed_path()).unwrap();
+        let request = QuantumTransactionRequest {
+            inner: alloy_rpc_types::TransactionRequest::default()
+                .with_chain_id(1337)
+                .with_nonce(0)
+                .with_to(QUANTUM_KEYVAULT_ADDRESS)
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(1)
+                .with_max_priority_fee_per_gas(1)
+                .with_input(Bytes::from(QUANTUM_BOOTSTRAP_SELECTOR.to_vec())),
+            sender: Some(Address::repeat_byte(0x22)),
+            key_id: Some(0),
+            nonce_key: Some(U256::ZERO),
+            init_primary_pubkey: Some(Bytes::from_static(&[0xAAu8; 32])),
+            init_cosigner_pubkey: None,
+        };
+
+        let err = sign_quantum_transaction_request(request, seed).unwrap_err();
+        assert!(err.to_string().contains("init_primary_pubkey"), "unexpected error: {err}");
     }
 
     #[test]

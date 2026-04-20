@@ -379,6 +379,17 @@ fn encode_empty_list(out: &mut dyn BufMut) {
     RlpHeader { list: true, payload_length: 0 }.encode(out);
 }
 
+fn decode_empty_list(buf: &mut &[u8]) -> alloy_rlp::Result<()> {
+    let header = RlpHeader::decode(buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    if header.payload_length != 0 {
+        return Err(alloy_rlp::Error::Custom("expected empty list for reserved field"));
+    }
+    Ok(())
+}
+
 fn encode_optional_list_bytes(value: Option<&Bytes>, out: &mut dyn BufMut) {
     match value {
         // Preserve the raw RLP list framing produced by `decode_list_bytes`.
@@ -625,8 +636,11 @@ impl QuantumTxEnvelope {
         let gas_limit = u64::decode(buf)?;
         let call = decode_single_call_list(buf)?;
         let access_list = AccessList::decode(buf)?;
-        let _fee_payer = decode_optional_list_bytes(buf)?;
-        let _fee_payer_key_id = decode_optional_list_bytes(buf)?;
+        // Reserved fee-payer placeholders are always encoded as empty lists.
+        // Reject non-empty values so decode→re-encode cannot silently change
+        // the envelope hash.
+        decode_empty_list(buf)?;
+        decode_empty_list(buf)?;
         let init_primary_pubkey = decode_option_pubkey_list(buf)?;
         let init_cosigner_pubkey = decode_option_pubkey_list(buf)?;
         let sender_sig = decode_list_bytes(buf)?;
@@ -1140,6 +1154,27 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let decoded: QuantumTransactionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn decode_empty_list_rejects_non_empty_reserved_placeholder() {
+        // The canonical encoder writes reserved fee-payer placeholder fields
+        // as empty lists. `decode_empty_list` must reject any other list so
+        // decode→re-encode cannot silently change the envelope hash.
+        let empty = [alloy_rlp::EMPTY_LIST_CODE];
+        assert!(decode_empty_list(&mut empty.as_ref()).is_ok());
+
+        // `list(string(0x80))`: outer list header `0xc1` followed by empty string `0x80`.
+        let non_empty = [0xc1u8, 0x80u8];
+        let err = decode_empty_list(&mut non_empty.as_ref())
+            .expect_err("non-empty list must be rejected");
+        assert!(format!("{err}").contains("reserved"), "unexpected error: {err}");
+
+        // A string (non-list) must also be rejected.
+        let string_bytes = [0x80u8];
+        let err =
+            decode_empty_list(&mut string_bytes.as_ref()).expect_err("string must be rejected");
+        assert!(matches!(err, alloy_rlp::Error::UnexpectedString));
     }
 
     #[test]

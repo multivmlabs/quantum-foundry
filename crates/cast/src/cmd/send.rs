@@ -212,8 +212,19 @@ impl SendTxArgs {
             .transpose()?;
 
         if is_bootstrap {
-            if tx.quantum.init_primary_pubkey.is_none() {
-                tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+            // Mirror the dedicated `cast quantum bootstrap` invariant: a
+            // caller-supplied `init_primary_pubkey` must match the key derived
+            // from the signing seed, otherwise the operator initializes a key
+            // they cannot sign with. Auto-fill when omitted.
+            let derived = derive_primary_pubkey(primary_seed);
+            match tx.quantum.init_primary_pubkey.as_ref() {
+                None => tx.quantum.init_primary_pubkey = Some(derived),
+                Some(provided) if provided != &derived => {
+                    return Err(eyre!(
+                        "--quantum.init-primary-pubkey does not match the public key derived from --quantum.primary-seed-file; omit the flag to auto-fill"
+                    ));
+                }
+                Some(_) => {}
             }
             // Bootstrap/lifecycle calls cannot be simulated via `eth_estimateGas` because
             // the validator-published bootstrap transient state is absent. Apply the fixed

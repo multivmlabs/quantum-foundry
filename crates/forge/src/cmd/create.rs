@@ -699,7 +699,13 @@ impl CreateArgs {
                     e
                 }
             })?;
-        let is_legacy = self.tx.legacy || Chain::from(chain).is_legacy();
+        // Quantum signing requires EIP-1559 fee fields; reject the legacy-fee
+        // path up front instead of failing late in signing.
+        if self.tx.legacy || Chain::from(chain).is_legacy() {
+            eyre::bail!(
+                "forge create --quantum requires EIP-1559 fees; legacy-fee chains and --legacy are not supported"
+            );
+        }
 
         deployer.tx.set_from(deployer_address);
         deployer.tx.set_chain_id(chain);
@@ -707,7 +713,7 @@ impl CreateArgs {
             deployer.tx.set_create();
         }
 
-        self.tx.apply::<QuantumNetwork>(&mut deployer.tx, is_legacy);
+        self.tx.apply::<QuantumNetwork>(&mut deployer.tx, false);
 
         if self.tx.nonce.is_none() {
             deployer.tx.set_nonce(provider.get_transaction_count(deployer_address).await?);
@@ -725,14 +731,11 @@ impl CreateArgs {
             deployer.tx.set_gas_limit(provider.estimate_gas(deployer.tx.clone()).await?);
         }
 
-        if is_legacy {
-            if self.tx.gas_price.is_none() {
-                deployer.tx.set_gas_price(provider.get_gas_price().await?);
-            }
-        } else if self.tx.gas_price.is_none() || self.tx.priority_gas_price.is_none() {
-            let estimate = provider.estimate_eip1559_fees().await.wrap_err(
-                "Failed to estimate EIP1559 fees. This chain might not support EIP1559, try adding --legacy to your command.",
-            )?;
+        if self.tx.gas_price.is_none() || self.tx.priority_gas_price.is_none() {
+            let estimate = provider
+                .estimate_eip1559_fees()
+                .await
+                .wrap_err("Failed to estimate EIP1559 fees; Quantum requires an EIP-1559 chain")?;
             if self.tx.priority_gas_price.is_none() {
                 deployer.tx.set_max_priority_fee_per_gas(estimate.max_priority_fee_per_gas);
             }
