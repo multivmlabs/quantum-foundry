@@ -128,6 +128,13 @@ impl CreateArgs {
         if self.tx.tempo.is_tempo() {
             return Err(eyre!("Quantum and Tempo options cannot be combined"));
         }
+        // Blob flags are applied through the shared `TransactionOpts`, but the
+        // Quantum transaction builder leaves blob setters on their default
+        // no-op implementations, so these flags would be silently dropped
+        // rather than encoded into the 0x7A envelope.
+        if self.tx.blob || self.tx.eip4844 || self.tx.blob_gas_price.is_some() {
+            return Err(eyre!("the Quantum adapter path does not support blob transactions"));
+        }
 
         let sender = self
             .tx

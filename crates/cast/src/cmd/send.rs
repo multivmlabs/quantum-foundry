@@ -132,6 +132,13 @@ impl SendTxArgs {
         if path.is_some() {
             return Err(eyre!("the Quantum adapter path does not support blob data"));
         }
+        // Blob flags are applied through the shared `TransactionOpts`, but the
+        // Quantum transaction builder leaves blob setters on their default
+        // no-op implementations, so these flags would be silently dropped
+        // rather than encoded into the 0x7A envelope.
+        if tx.blob || tx.eip4844 || tx.blob_gas_price.is_some() {
+            return Err(eyre!("the Quantum adapter path does not support blob transactions"));
+        }
         // Quantum signing requires EIP-1559 fee fields; reject the legacy-fee
         // path up front instead of failing late in request construction.
         // Mirrors `forge create --quantum` at crates/forge/src/cmd/create.rs.
