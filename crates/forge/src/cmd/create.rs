@@ -136,6 +136,15 @@ impl CreateArgs {
             .ok_or_else(|| eyre!("--quantum.sender is required for Quantum writes"))?;
         validate_quantum_sender(self.eth.wallet.from, sender)?;
 
+        // Quantum v1 does not carry EIP-7702 authorization lists in the signed
+        // 0x7a envelope. Reject `--auth` explicitly so callers do not believe a
+        // 7702 auth is being broadcast when it would be silently dropped.
+        if !self.tx.auth.is_empty() {
+            return Err(eyre!(
+                "the Quantum adapter path does not support EIP-7702 `--auth`; the v1 envelope does not carry authorization lists"
+            ));
+        }
+
         let primary_seed = if self.broadcast {
             let path = self.tx.quantum.primary_seed_file.as_ref().ok_or_else(|| {
                 eyre!("--quantum.primary-seed-file is required for Quantum writes")

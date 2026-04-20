@@ -183,6 +183,16 @@ impl SendTxArgs {
 
         let is_bootstrap = destination_is_keyvault && quantum_input_is_bootstrap(sig.as_deref());
 
+        // `bootstrapKey()` is non-payable: forwarding ETH to it is an operator
+        // mistake. The dedicated `cast quantum bootstrap` UX rejects `--value`
+        // for all lifecycle writes; mirror the invariant here so both sanctioned
+        // entry points behave the same for the bootstrap selector.
+        if is_bootstrap && tx.value.is_some_and(|v| !v.is_zero()) {
+            return Err(eyre!(
+                "Quantum bootstrap does not accept `--value`; bootstrapKey() is non-payable"
+            ));
+        }
+
         // v1 bootstrap is primary-only: `cast quantum bootstrap` rejects any
         // cosigner artifact, and `cast send --quantum` must enforce the same
         // invariant so both sanctioned entry points produce the same envelope
@@ -471,9 +481,19 @@ fn strip_hex_prefix(value: &str) -> &str {
     value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value)
 }
 
+/// Return the portion of `sig` before the first `(`, with surrounding
+/// whitespace stripped. Used to match bare function names (no parentheses) the
+/// same way signatures like `bootstrapKey()` are matched — callers like
+/// `parse_function_args` fall through to Etherscan lookup for bare names, so
+/// the lifecycle fence must recognize them locally to avoid being bypassed.
+fn function_name_prefix(sig: &str) -> &str {
+    let trimmed = sig.trim();
+    trimmed.split_once('(').map_or(trimmed, |(name, _)| name.trim())
+}
+
 fn quantum_input_is_bootstrap(input: Option<&str>) -> bool {
     let Some(input) = input else { return false };
-    if input.starts_with("bootstrapKey(") {
+    if function_name_prefix(input) == "bootstrapKey" {
         return true;
     }
     let hex_body = strip_hex_prefix(input.trim()).to_ascii_lowercase();
@@ -483,10 +503,7 @@ fn quantum_input_is_bootstrap(input: Option<&str>) -> bool {
 fn quantum_input_is_unsupported_lifecycle(input: Option<&str>) -> bool {
     let Some(input) = input else { return false };
     let trimmed = input.trim();
-    if trimmed.starts_with("addKey(")
-        || trimmed.starts_with("removeKey(")
-        || trimmed.starts_with("updateKeyAuth(")
-    {
+    if matches!(function_name_prefix(trimmed), "addKey" | "removeKey" | "updateKeyAuth") {
         return true;
     }
     let hex_body = strip_hex_prefix(trimmed).to_ascii_lowercase();
@@ -527,10 +544,29 @@ where
 mod tests {
     use clap::CommandFactory;
 
-    use super::SendTxArgs;
+    use super::{SendTxArgs, quantum_input_is_bootstrap, quantum_input_is_unsupported_lifecycle};
 
     #[test]
     fn send_command_clap_shape_is_valid() {
         SendTxArgs::command().debug_assert();
+    }
+
+    #[test]
+    fn bare_lifecycle_names_trip_the_fence() {
+        assert!(quantum_input_is_bootstrap(Some("bootstrapKey")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some("addKey")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some("removeKey")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some("updateKeyAuth")));
+        // Unrelated bare names must not be treated as lifecycle calls.
+        assert!(!quantum_input_is_bootstrap(Some("transfer")));
+        assert!(!quantum_input_is_unsupported_lifecycle(Some("transfer")));
+    }
+
+    #[test]
+    fn parenthesized_lifecycle_names_still_trip_the_fence() {
+        assert!(quantum_input_is_bootstrap(Some("bootstrapKey()")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some(
+            "addKey(uint32,bytes,uint8,bytes,uint8,uint8,bytes)"
+        )));
     }
 }

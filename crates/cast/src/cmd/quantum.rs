@@ -198,10 +198,19 @@ async fn run_bootstrap(args: BootstrapArgs) -> Result<()> {
     }
 
     // Populate the bootstrap `init_primary_pubkey` field if the caller did not
-    // provide one. Mirrors `cast send` bootstrap behavior.
+    // provide one. Mirrors `cast send` bootstrap behavior. If the caller did
+    // provide one, it must match the key derived from the signing seed — a
+    // mismatch would initialize a key the caller cannot sign with.
     let primary_seed = parse_seed_file(&common.primary_seed_file)?;
-    if common.tx.quantum.init_primary_pubkey.is_none() {
-        common.tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+    let derived = derive_primary_pubkey(primary_seed);
+    match common.tx.quantum.init_primary_pubkey.as_ref() {
+        None => common.tx.quantum.init_primary_pubkey = Some(derived),
+        Some(provided) if provided != &derived => {
+            return Err(eyre!(
+                "--quantum.init-primary-pubkey does not match the public key derived from --primary-seed-file; omit the flag to auto-fill"
+            ));
+        }
+        Some(_) => {}
     }
 
     submit_lifecycle(common, encode_bootstrap_calldata(), true).await
@@ -265,6 +274,21 @@ async fn submit_lifecycle(
     calldata: Bytes,
     is_bootstrap: bool,
 ) -> Result<()> {
+    // Fail closed on a mismatched `--from`. `cast send --quantum` and
+    // `forge create --quantum` both reject a `--from` that disagrees with the
+    // quantum sender; `cast quantum` must enforce the same invariant so an
+    // operator cannot think they are acting as one account while the command
+    // actually signs for another.
+    if let Some(from) = common.send_tx.eth.wallet.from
+        && from != common.sender
+    {
+        return Err(eyre!(
+            "--from must match --sender when using the Quantum lifecycle path; got {} and {}",
+            from,
+            common.sender,
+        ));
+    }
+
     // Set the quantum sender on the shared TransactionOpts so the wallet glue
     // finds it. The sender is the account being mutated, on whose behalf the
     // ML-DSA signer produces the primary signature.
@@ -305,6 +329,15 @@ async fn submit_lifecycle(
     // almost always an operator mistake.
     if common.tx.value.is_some_and(|v| !v.is_zero()) {
         return Err(eyre!("KeyVault lifecycle writes do not accept `--value`; remove the flag"));
+    }
+
+    // Quantum v1 does not carry EIP-7702 authorization lists in the signed
+    // 0x7a envelope. Reject `--auth` explicitly so callers do not believe a
+    // 7702 auth is being broadcast when it would be silently dropped.
+    if !common.tx.auth.is_empty() {
+        return Err(eyre!(
+            "the Quantum adapter path does not support EIP-7702 `--auth`; the v1 envelope does not carry authorization lists"
+        ));
     }
 
     let primary_seed = parse_seed_file(&common.primary_seed_file)?;

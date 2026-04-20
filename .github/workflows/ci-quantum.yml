@@ -48,7 +48,7 @@ jobs:
       # external networks (Etherscan, live mainnet RPC, flaky fork endpoints)
       # and fail in isolated CI environments regardless of this fork's changes.
       - name: Quantum package tests
-        run: cargo test -p foundry-common -p foundry-primitives -p foundry-cli
+        run: cargo test -p foundry-common -p foundry-primitives -p foundry-cli -p cast
 
       # Targeted Quantum regression: pinned golden fixture and composite RLP envelope.
       # Multiple filters must follow `--` (cargo test accepts only a single

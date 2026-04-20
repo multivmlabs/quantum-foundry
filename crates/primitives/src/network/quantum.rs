@@ -411,6 +411,51 @@ fn decode_list_bytes(buf: &mut &[u8]) -> alloy_rlp::Result<Bytes> {
     Ok(raw)
 }
 
+/// Encode an optional pubkey as `list(string(bytes))`, matching the signing-path
+/// encoding in `QuantumWriteRequestV1`. Paired with `decode_option_pubkey_list`,
+/// which strips the outer list + inner string framing so stored bytes carry
+/// pubkey payload only.
+fn encode_option_pubkey_list(value: Option<&Bytes>, out: &mut dyn BufMut) {
+    match value {
+        Some(value) => {
+            let payload_length = value.length();
+            RlpHeader { list: true, payload_length }.encode(out);
+            value.encode(out);
+        }
+        None => encode_empty_list(out),
+    }
+}
+
+fn option_pubkey_list_length(value: Option<&Bytes>) -> usize {
+    match value {
+        Some(value) => {
+            let payload_length = value.length();
+            alloy_rlp::length_of_length(payload_length) + payload_length
+        }
+        None => 1,
+    }
+}
+
+fn decode_option_pubkey_list(buf: &mut &[u8]) -> alloy_rlp::Result<Option<Bytes>> {
+    let header = RlpHeader::decode(buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    if header.payload_length == 0 {
+        return Ok(None);
+    }
+    let start_len = buf.len();
+    let pubkey = Bytes::decode(buf)?;
+    let consumed = start_len - buf.len();
+    if consumed != header.payload_length {
+        return Err(alloy_rlp::Error::ListLengthMismatch {
+            expected: header.payload_length,
+            got: consumed,
+        });
+    }
+    Ok(Some(pubkey))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuantumTxEnvelope {
     chain_id: ChainId,
@@ -528,8 +573,8 @@ impl QuantumTxEnvelope {
             + self.access_list.length()
             + 1
             + 1
-            + optional_list_bytes_length(self.init_primary_pubkey.as_ref())
-            + optional_list_bytes_length(self.init_cosigner_pubkey.as_ref())
+            + option_pubkey_list_length(self.init_primary_pubkey.as_ref())
+            + option_pubkey_list_length(self.init_cosigner_pubkey.as_ref())
     }
 
     fn encode_fields(&self, out: &mut dyn BufMut) {
@@ -545,8 +590,8 @@ impl QuantumTxEnvelope {
         self.access_list.encode(out);
         encode_empty_list(out);
         encode_empty_list(out);
-        encode_optional_list_bytes(self.init_primary_pubkey.as_ref(), out);
-        encode_optional_list_bytes(self.init_cosigner_pubkey.as_ref(), out);
+        encode_option_pubkey_list(self.init_primary_pubkey.as_ref(), out);
+        encode_option_pubkey_list(self.init_cosigner_pubkey.as_ref(), out);
     }
 
     fn encode_inner(&self, out: &mut dyn BufMut) {
@@ -582,8 +627,8 @@ impl QuantumTxEnvelope {
         let access_list = AccessList::decode(buf)?;
         let _fee_payer = decode_optional_list_bytes(buf)?;
         let _fee_payer_key_id = decode_optional_list_bytes(buf)?;
-        let init_primary_pubkey = decode_optional_list_bytes(buf)?;
-        let init_cosigner_pubkey = decode_optional_list_bytes(buf)?;
+        let init_primary_pubkey = decode_option_pubkey_list(buf)?;
+        let init_cosigner_pubkey = decode_option_pubkey_list(buf)?;
         let sender_sig = decode_list_bytes(buf)?;
         let fee_payer_sig = decode_optional_list_bytes(buf)?;
 
@@ -1057,6 +1102,22 @@ mod tests {
         assert_eq!(tx.sender(), expected_sender);
         assert_eq!(tx.key_id(), value["key_id"].as_u64().unwrap() as u32);
         assert_eq!(tx.nonce_key(), U256::ZERO);
+    }
+
+    #[test]
+    fn envelope_bootstrap_pubkey_round_trips_to_request_as_semantic_bytes() {
+        // Exercise the decoded envelope path by round-tripping the phase-0
+        // fixture, which has `init_primary_pubkey = None`, and confirm the
+        // request view also sees `None` (not the raw RLP empty-list marker).
+        let fixture = raw_fixture();
+        let raw = fixture["raw_transaction"].as_str().unwrap();
+        let bytes = alloy_primitives::hex::decode(raw).unwrap();
+        let decoded = QuantumTxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert!(decoded.init_primary_pubkey.is_none());
+
+        let request: QuantumTransactionRequest = decoded.into();
+        assert!(request.init_primary_pubkey.is_none());
+        assert!(request.init_cosigner_pubkey.is_none());
     }
 
     #[test]
