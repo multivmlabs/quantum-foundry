@@ -23,13 +23,40 @@ This fork is a drop-in replacement for upstream Foundry while Quantum-specific f
 
 ## Installation
 
-Build from source in this repository:
+```sh
+curl -L https://raw.githubusercontent.com/multivmlabs/quantum-foundry/HEAD/foundryup/install | bash
+foundryup --network quantum
+```
+
+This installs the Quantum-enabled `forge`, `cast`, `anvil`, and `chisel` from this fork's GitHub Releases into `~/.foundry-quantum/bin/`. The separate directory means quantum-foundry coexists with an existing upstream Foundry install at `~/.foundry/` — neither installer overwrites the other's binaries. If both are on your `PATH`, the one listed earlier wins for commands like `forge` and `cast`.
+
+<details>
+<summary>Building from source (contributors and unsupported platforms)</summary>
 
 ```sh
 cargo build --release -p forge -p cast -p anvil -p chisel
 ```
 
 The `target/release` binaries are drop-in replacements for upstream `forge`, `cast`, `anvil`, and `chisel`.
+
+</details>
+
+## Devnet
+
+Quantum's public devnet is available for early testing. **Note: the devnet is unstable — state may be wiped, chain ID may change, and downtime should be expected. A public testnet is targeted for mid-2026.**
+
+| Property           | Value                                 |
+| ------------------ | ------------------------------------- |
+| **Network Name**   | Quantum Devnet                        |
+| **Chain ID**       | `1337`                                |
+| **HTTP URL**       | `https://devnet2.rpc.quantum.systems` |
+| **Block Explorer** | `https://quantumscan.org/`            |
+
+Example:
+
+```sh
+cast block-number --rpc-url https://devnet2.rpc.quantum.systems
+```
 
 ## Changeset
 

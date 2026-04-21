@@ -10,6 +10,17 @@ Update or revert to a specific Foundry branch with ease.
 curl -L https://foundry.paradigm.xyz | bash
 ```
 
+### Installing for the Quantum network
+
+To install `foundryup` from this fork (required to run `foundryup --network quantum`):
+
+```sh
+curl -L https://raw.githubusercontent.com/multivmlabs/quantum-foundry/HEAD/foundryup/install | bash
+foundryup --network quantum
+```
+
+Quantum-foundry installs into `~/.foundry-quantum/` (not `~/.foundry/`) so it can coexist with an existing upstream Foundry install without overwriting its `foundryup`, `forge`, `cast`, `anvil`, or `chisel` binaries. If both are on your `PATH`, the directory listed earlier wins.
+
 ## Usage
 
 To install the **nightly** version:
