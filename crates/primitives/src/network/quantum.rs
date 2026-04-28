@@ -612,8 +612,14 @@ impl QuantumTxEnvelope {
     }
 
     fn inner_length(&self) -> usize {
+        // `sender_sig` is stored as the raw RLP list bytes produced by
+        // `decode_list_bytes`, and `encode_inner` writes it back unchanged via
+        // `put_slice`. Use the raw byte length here so the outer list header
+        // matches what is actually emitted; `Bytes::length()` would re-add an
+        // RLP string header and break decode→encode byte stability (and the
+        // resulting tx hash).
         self.encoded_fields_length()
-            + self.sender_sig.length()
+            + self.sender_sig.len()
             + optional_list_bytes_length(self.fee_payer_sig.as_ref())
     }
 
@@ -644,6 +650,15 @@ impl QuantumTxEnvelope {
         let init_primary_pubkey = decode_option_pubkey_list(buf)?;
         let init_cosigner_pubkey = decode_option_pubkey_list(buf)?;
         let sender_sig = decode_list_bytes(buf)?;
+        // `decode_list_bytes` returns the raw outer-list framing, so an empty
+        // RLP list (`0xc0`) is stored as `Bytes([0xc0])` rather than empty
+        // bytes. The composite signature payload is non-empty by construction,
+        // so reject the empty-list marker here — otherwise the structural
+        // `is_empty()` guard in `recover_signer` would let a structurally
+        // empty signature through.
+        if sender_sig.len() == 1 && sender_sig[0] == alloy_rlp::EMPTY_LIST_CODE {
+            return Err(alloy_rlp::Error::Custom("sender_sig must be non-empty"));
+        }
         let fee_payer_sig = decode_optional_list_bytes(buf)?;
 
         Ok(Self::from_signed_parts(
@@ -898,14 +913,18 @@ impl Decodable2718 for QuantumTxEnvelope {
 // malformed envelopes without pretending to do cryptographic verification.
 impl SignerRecoverable for QuantumTxEnvelope {
     fn recover_signer(&self) -> Result<Address, alloy_consensus::crypto::RecoveryError> {
-        if self.sender_sig.is_empty() {
+        if self.sender_sig.is_empty()
+            || (self.sender_sig.len() == 1 && self.sender_sig[0] == alloy_rlp::EMPTY_LIST_CODE)
+        {
             return Err(alloy_consensus::crypto::RecoveryError::new());
         }
         Ok(self.sender)
     }
 
     fn recover_signer_unchecked(&self) -> Result<Address, alloy_consensus::crypto::RecoveryError> {
-        if self.sender_sig.is_empty() {
+        if self.sender_sig.is_empty()
+            || (self.sender_sig.len() == 1 && self.sender_sig[0] == alloy_rlp::EMPTY_LIST_CODE)
+        {
             return Err(alloy_consensus::crypto::RecoveryError::new());
         }
         Ok(self.sender)
@@ -1134,6 +1153,26 @@ mod tests {
     }
 
     #[test]
+    fn phase0_raw_transaction_round_trips_byte_for_byte() {
+        // Decode → re-encode must reproduce the exact wire bytes (and hash) so
+        // the envelope's outer list length is consistent with its body. This
+        // is the regression for the `inner_length` vs `encode_inner` mismatch
+        // on `sender_sig` framing.
+        let value = raw_fixture();
+        let raw = value["raw_transaction"].as_str().unwrap();
+        let expected_bytes = alloy_primitives::hex::decode(raw).unwrap();
+        let expected_hash: B256 = value["raw_transaction_hash"].as_str().unwrap().parse().unwrap();
+
+        let tx = QuantumTxEnvelope::decode_2718(&mut expected_bytes.as_slice()).unwrap();
+
+        let mut reencoded = Vec::with_capacity(expected_bytes.len());
+        tx.encode_2718(&mut reencoded);
+        assert_eq!(reencoded, expected_bytes, "decode→encode is not byte-stable");
+        assert_eq!(keccak256(&reencoded), expected_hash);
+        assert_eq!(*tx.tx_hash(), expected_hash);
+    }
+
+    #[test]
     fn recover_signer_rejects_empty_sender_sig() {
         // ML-DSA signatures are not recoverable, so `recover_signer` returns
         // the declared sender — but it must refuse envelopes whose sender
@@ -1160,6 +1199,35 @@ mod tests {
 
         assert!(envelope.recover_signer().is_err());
         assert!(envelope.recover_signer_unchecked().is_err());
+
+        let mut envelope = envelope;
+        envelope.sender_sig = Bytes::from_static(&[alloy_rlp::EMPTY_LIST_CODE]);
+        assert!(envelope.recover_signer().is_err());
+        assert!(envelope.recover_signer_unchecked().is_err());
+    }
+
+    #[test]
+    fn decode_rejects_empty_list_sender_sig() {
+        // `decode_list_bytes` returns the raw outer-list framing, so a wire
+        // envelope carrying `sender_sig = 0xc0` (empty RLP list) would land
+        // in the field as `Bytes([0xc0])` and bypass the `is_empty()` guard
+        // in `recover_signer`. Decode must reject the empty-list marker so
+        // a structurally empty signature cannot reach the recovery path.
+        let mut fixture_envelope = {
+            let bytes =
+                alloy_primitives::hex::decode(raw_fixture()["raw_transaction"].as_str().unwrap())
+                    .unwrap();
+            QuantumTxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap()
+        };
+        fixture_envelope.sender_sig = Bytes::from_static(&[alloy_rlp::EMPTY_LIST_CODE]);
+        fixture_envelope.hash = OnceLock::new();
+
+        let mut buf = Vec::new();
+        fixture_envelope.encode_2718(&mut buf);
+
+        let err = QuantumTxEnvelope::decode_2718(&mut buf.as_slice())
+            .expect_err("decode must reject empty-list sender_sig");
+        assert!(matches!(err, Eip2718Error::RlpError(_)), "unexpected error: {err}");
     }
 
     #[test]
