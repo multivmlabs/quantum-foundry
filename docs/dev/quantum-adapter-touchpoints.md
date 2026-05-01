@@ -38,6 +38,12 @@ These files are already intentionally diverged from upstream as part of the Phas
   - wires `--network quantum` through `cast` read/decode dispatch and fails closed on raw paths that still need a real `QuantumNetwork` adapter
 - `crates/cast/src/cmd/da_estimate.rs`
   - rejects `--network quantum` explicitly instead of silently falling back to Ethereum behavior
+- `crates/cast/src/cmd/call.rs`
+  - fails closed on KeyVault lifecycle selectors so `cast call` keeps pure read paths on standard RPC simulation while rejecting unsupported lifecycle simulations with the frozen error message
+- `crates/cast/src/cmd/quantum.rs`
+  - `cast quantum` subcommand group (`bootstrap`, `add-key`, `remove-key`, `update-key-auth`) that builds KeyVault lifecycle calldata via the shared core, routes through `CastTxBuilder`, signs with the fork's ML-DSA signer, and broadcasts via `eth_sendRawTransaction`; distinguishes `--auth-key-id` (signer lane) from `--target-key-id` (key entry being mutated) and auto-applies `QUANTUM_LIFECYCLE_GAS_FLOOR`
+- `crates/common/src/transactions/quantum_lifecycle.rs`
+  - shared KeyVault lifecycle calldata builders (`encode_bootstrap_calldata`, `encode_add_key_calldata`, `encode_remove_key_calldata`, `encode_update_key_auth_calldata`) whose `sol!`-derived selectors are asserted byte-for-byte against the Phase 0 frozen selectors
 
 ## Reserved Phase 1 Adapter Patch Points
 

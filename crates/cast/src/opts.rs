@@ -4,9 +4,9 @@ use crate::cmd::{
     constructor_args::ConstructorArgsArgs, create2::Create2Args, creation_code::CreationCodeArgs,
     da_estimate::DAEstimateArgs, erc20::Erc20Subcommand, estimate::EstimateArgs,
     find_block::FindBlockArgs, interface::InterfaceArgs, keychain::KeychainSubcommand,
-    logs::LogsArgs, mktx::MakeTxArgs, rpc::RpcArgs, run::RunArgs, send::SendTxArgs,
-    storage::StorageArgs, tip20::Tip20Subcommand, trace::TraceArgs, txpool::TxPoolSubcommands,
-    wallet::WalletSubcommands,
+    logs::LogsArgs, mktx::MakeTxArgs, quantum::QuantumArgs, rpc::RpcArgs, run::RunArgs,
+    send::SendTxArgs, storage::StorageArgs, tip20::Tip20Subcommand, trace::TraceArgs,
+    txpool::TxPoolSubcommands, wallet::WalletSubcommands,
 };
 use alloy_ens::NameOrAddress;
 use alloy_primitives::{Address, B256, Selector, U256};
@@ -555,6 +555,10 @@ pub enum CastSubcommand {
     /// Sign and publish a transaction.
     #[command(name = "send", visible_alias = "s")]
     SendTx(SendTxArgs),
+
+    /// Quantum-native KeyVault lifecycle UX (bootstrap / add-key / remove-key / update-key-auth).
+    #[command(name = "quantum")]
+    Quantum(QuantumArgs),
 
     /// Build and sign a batch transaction (Tempo).
     #[command(name = "batch-mktx", visible_alias = "bm")]
