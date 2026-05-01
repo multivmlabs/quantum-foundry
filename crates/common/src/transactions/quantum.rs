@@ -14,9 +14,16 @@ use crate::{
 use foundry_primitives::QuantumTransactionRequest;
 
 pub const QUANTUM_ML_DSA_SCHEME: u8 = 0x01;
+pub const QUANTUM_P256_SCHEME: u8 = 0x02;
+pub const QUANTUM_ECDSA_SCHEME: u8 = 0x03;
 pub const ML_DSA_PUBLIC_KEY_BYTES: usize = 1312;
 pub const ML_DSA_SIGNATURE_BYTES: usize = 2420;
 pub const ML_DSA_SEED_BYTES: usize = 32;
+pub const DETACHED_CLASSICAL_SIGNATURE_BYTES: usize = 64;
+
+pub const QUANTUM_DETACHED_ARTIFACT_VERSION: u8 = 1;
+pub const QUANTUM_DETACHED_SCHEME_P256: &str = "p256";
+pub const QUANTUM_DETACHED_SCHEME_ECDSA: &str = "ecdsa";
 pub const PHASE0_FOUNDY_BASE_COMMIT: &str = "f1abb2ca347187bb6dea8c3881ca44ce50aab1e7";
 pub const PHASE0_QUANTUM_HARNESS_COMMIT: &str = "8f3612c60f9fa66ea3a09eab99a2e0802f373673";
 pub const PHASE0_TX_SPAMMER_EVIDENCE_COMMIT: &str = "2c25f14a44b8cc88fc41a65f521f1ba8350e7fa4";
@@ -25,6 +32,14 @@ pub const QUANTUM_REMOVE_KEY_SELECTOR: [u8; 4] = [0xc9, 0x8f, 0x21, 0xf4];
 pub const QUANTUM_UPDATE_KEY_AUTH_SELECTOR: [u8; 4] = [0x89, 0x08, 0x15, 0x4b];
 pub const QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE: &str =
     "KeyVault lifecycle operations beyond bootstrapKey() require explicit lifecycle transaction submission";
+
+/// Fixed gas limit for Quantum KeyVault bootstrap and lifecycle transactions.
+///
+/// KeyVault bootstrap writes depend on validator-published transient state that
+/// `eth_estimateGas` simulation cannot reproduce, so the reference `quantum-send-tx`
+/// CLI skips estimation and uses this floor directly. Mirrors `LIFECYCLE_GAS_FLOOR`
+/// in `quantum-eth2/bin/send-tx/src/main.rs`.
+pub const QUANTUM_LIFECYCLE_GAS_FLOOR: u64 = 2_100_000;
 
 pub const QUANTUM_SEND_UNSUPPORTED_LIFECYCLE_SELECTORS: [[u8; 4]; 3] = [
     QUANTUM_ADD_KEY_SELECTOR,
@@ -39,6 +54,118 @@ pub struct DetachedArtifactV1 {
     pub signing_hash: String,
     pub public_key: String,
     pub signature: String,
+}
+
+/// Detached cosigner scheme supported by the shared v1 Quantum signer surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetachedCosignerScheme {
+    P256,
+    Ecdsa,
+}
+
+impl DetachedCosignerScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::P256 => QUANTUM_DETACHED_SCHEME_P256,
+            Self::Ecdsa => QUANTUM_DETACHED_SCHEME_ECDSA,
+        }
+    }
+
+    fn from_artifact_scheme(scheme: &str) -> Result<Self> {
+        match scheme {
+            QUANTUM_DETACHED_SCHEME_P256 => Ok(Self::P256),
+            QUANTUM_DETACHED_SCHEME_ECDSA => Ok(Self::Ecdsa),
+            other => {
+                bail!(
+                    "unsupported Quantum detached cosigner scheme `{other}`; expected one of `p256`, `ecdsa`"
+                )
+            }
+        }
+    }
+}
+
+/// Parsed detached cosigner artifact ready for composite-signature attachment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachedCosigner {
+    pub scheme: DetachedCosignerScheme,
+    pub signing_hash: B256,
+    pub public_key: Vec<u8>,
+    pub signature: [u8; DETACHED_CLASSICAL_SIGNATURE_BYTES],
+}
+
+impl DetachedCosigner {
+    /// Parse and validate a v1 detached artifact from raw JSON bytes.
+    pub fn from_artifact_json(bytes: &[u8]) -> Result<Self> {
+        let artifact: DetachedArtifactV1 = serde_json::from_slice(bytes)
+            .map_err(|err| eyre::eyre!("failed to parse Quantum detached artifact: {err}"))?;
+        Self::from_artifact(artifact)
+    }
+
+    /// Parse and validate a v1 detached artifact loaded from disk.
+    pub fn from_artifact_file(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).map_err(|err| {
+            eyre::eyre!(
+                "failed to read Quantum detached artifact `{}`: {err}",
+                path.display()
+            )
+        })?;
+        Self::from_artifact_json(&bytes)
+    }
+
+    /// Validate and normalize a parsed artifact into its runtime form.
+    pub fn from_artifact(artifact: DetachedArtifactV1) -> Result<Self> {
+        if artifact.version != QUANTUM_DETACHED_ARTIFACT_VERSION {
+            bail!(
+                "unsupported Quantum detached artifact version `{}`; expected `{}`",
+                artifact.version,
+                QUANTUM_DETACHED_ARTIFACT_VERSION
+            );
+        }
+
+        let scheme = DetachedCosignerScheme::from_artifact_scheme(&artifact.scheme)?;
+        let signing_hash = parse_hex_b256(&artifact.signing_hash, "signing_hash")?;
+        let public_key = parse_hex_bytes(&artifact.public_key, "public_key")?;
+        if public_key.is_empty() {
+            bail!("Quantum detached artifact public_key must not be empty");
+        }
+        let signature_bytes = parse_hex_bytes(&artifact.signature, "signature")?;
+        let signature =
+            <[u8; DETACHED_CLASSICAL_SIGNATURE_BYTES]>::try_from(signature_bytes.as_slice())
+                .map_err(|_| {
+                    eyre::eyre!(
+                        "Quantum detached {} signature must be {} bytes",
+                        scheme.as_str(),
+                        DETACHED_CLASSICAL_SIGNATURE_BYTES
+                    )
+                })?;
+
+        Ok(Self { scheme, signing_hash, public_key, signature })
+    }
+
+    fn into_signing_key_signature(self) -> SigningKeySignature {
+        match self.scheme {
+            DetachedCosignerScheme::P256 => SigningKeySignature::P256 { signature: self.signature },
+            DetachedCosignerScheme::Ecdsa => {
+                SigningKeySignature::Ecdsa { signature: self.signature }
+            }
+        }
+    }
+}
+
+fn parse_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>> {
+    let trimmed = value.trim();
+    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+    alloy_primitives::hex::decode(hex).map_err(|err| {
+        eyre::eyre!("Quantum detached artifact `{field}` is not valid hex: {err}")
+    })
+}
+
+fn parse_hex_b256(value: &str, field: &str) -> Result<B256> {
+    let bytes = parse_hex_bytes(value, field)?;
+    if bytes.len() != 32 {
+        bail!("Quantum detached artifact `{field}` must be 32 bytes");
+    }
+    Ok(B256::from_slice(&bytes))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +199,8 @@ struct CompositeSignature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SigningKeySignature {
     MlDsa44 { signature: Box<[u8; ML_DSA_SIGNATURE_BYTES]> },
+    P256 { signature: [u8; DETACHED_CLASSICAL_SIGNATURE_BYTES] },
+    Ecdsa { signature: [u8; DETACHED_CLASSICAL_SIGNATURE_BYTES] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,24 +228,49 @@ pub fn derive_primary_pubkey(primary_seed: [u8; ML_DSA_SEED_BYTES]) -> Bytes {
 }
 
 pub fn sign_quantum_transaction_request(
+    tx: QuantumTransactionRequest,
+    primary_seed: [u8; ML_DSA_SEED_BYTES],
+) -> Result<QuantumSignedPayload> {
+    sign_quantum_transaction_request_with_cosigner(tx, primary_seed, None)
+}
+
+pub fn sign_quantum_transaction_request_with_cosigner(
     mut tx: QuantumTransactionRequest,
     primary_seed: [u8; ML_DSA_SEED_BYTES],
+    cosigner: Option<DetachedCosigner>,
 ) -> Result<QuantumSignedPayload> {
     if tx.init_primary_pubkey.is_none() && quantum_transaction_request_is_bootstrap(&tx) {
         tx.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
     }
 
     let request = QuantumWriteRequestV1::from_quantum_transaction_request(&tx)?;
-    sign_quantum_write_request(request, primary_seed)
+    sign_quantum_write_request_with_cosigner(request, primary_seed, cosigner)
 }
 
 pub fn sign_quantum_write_request(
     request: QuantumWriteRequestV1,
     primary_seed: [u8; ML_DSA_SEED_BYTES],
 ) -> Result<QuantumSignedPayload> {
+    sign_quantum_write_request_with_cosigner(request, primary_seed, None)
+}
+
+pub fn sign_quantum_write_request_with_cosigner(
+    request: QuantumWriteRequestV1,
+    primary_seed: [u8; ML_DSA_SEED_BYTES],
+    cosigner: Option<DetachedCosigner>,
+) -> Result<QuantumSignedPayload> {
     validate_quantum_write_request(&request)?;
 
     let signing_hash = request.signature_hash();
+
+    if let Some(ref cosigner) = cosigner
+        && cosigner.signing_hash != signing_hash
+    {
+        bail!(
+            "Quantum detached cosigner signing_hash does not match the request signing hash; refusing to attach cosigner"
+        );
+    }
+
     let seed = ml_dsa::B32::from(primary_seed);
     let keypair = <MlDsa44 as KeyGen>::from_seed(&seed);
     let ml_sig = keypair
@@ -132,9 +286,11 @@ pub fn sign_quantum_write_request(
         ),
     };
 
+    let cosigner_sig = cosigner.map(DetachedCosigner::into_signing_key_signature);
+
     let signed = QuantumSigned {
         tx: request.clone(),
-        sender_sig: CompositeSignature { primary, cosigner: None },
+        sender_sig: CompositeSignature { primary, cosigner: cosigner_sig },
     };
 
     let mut raw_transaction = Vec::with_capacity(signed.encode_2718_len());
@@ -230,6 +386,7 @@ impl SigningKeySignature {
     fn wire_size(&self) -> usize {
         match self {
             Self::MlDsa44 { .. } => 1 + ML_DSA_SIGNATURE_BYTES,
+            Self::P256 { .. } | Self::Ecdsa { .. } => 1 + DETACHED_CLASSICAL_SIGNATURE_BYTES,
         }
     }
 }
@@ -240,6 +397,14 @@ impl Encodable for SigningKeySignature {
         match self {
             Self::MlDsa44 { signature } => {
                 bytes.push(QUANTUM_ML_DSA_SCHEME);
+                bytes.extend_from_slice(signature.as_ref());
+            }
+            Self::P256 { signature } => {
+                bytes.push(QUANTUM_P256_SCHEME);
+                bytes.extend_from_slice(signature.as_ref());
+            }
+            Self::Ecdsa { signature } => {
+                bytes.push(QUANTUM_ECDSA_SCHEME);
                 bytes.extend_from_slice(signature.as_ref());
             }
         }
@@ -402,6 +567,130 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(raw_fixture_path()).unwrap()).unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    fn simple_transfer_request(sender: Address) -> QuantumWriteRequestV1 {
+        QuantumWriteRequestV1 {
+            sender,
+            key_id: 0,
+            nonce: 0,
+            chain_id: 1337,
+            max_priority_fee_per_gas: 1,
+            max_fee_per_gas: 1,
+            gas_limit: 21_000,
+            call: QuantumSingleCall {
+                kind: TxKind::Call(Address::repeat_byte(0x44)),
+                value: U256::from(1u64),
+                input: Bytes::new(),
+            },
+            access_list: Default::default(),
+            bootstrap: None,
+        }
+    }
+
+    fn artifact_for(scheme: &str, signing_hash: B256) -> DetachedArtifactV1 {
+        DetachedArtifactV1 {
+            version: QUANTUM_DETACHED_ARTIFACT_VERSION,
+            scheme: scheme.to_string(),
+            signing_hash: format!("{:#x}", signing_hash),
+            public_key: format!("0x{}", alloy_primitives::hex::encode([0x11u8; 33])),
+            signature: format!(
+                "0x{}",
+                alloy_primitives::hex::encode([0x22u8; DETACHED_CLASSICAL_SIGNATURE_BYTES])
+            ),
+        }
+    }
+
+    #[test]
+    fn detached_artifact_rejects_unknown_version() {
+        let mut artifact = artifact_for(QUANTUM_DETACHED_SCHEME_P256, B256::ZERO);
+        artifact.version = 2;
+        let err = DetachedCosigner::from_artifact(artifact).unwrap_err();
+        assert!(err.to_string().contains("unsupported Quantum detached artifact version"));
+    }
+
+    #[test]
+    fn detached_artifact_rejects_unknown_scheme() {
+        let artifact = artifact_for("rsa", B256::ZERO);
+        let err = DetachedCosigner::from_artifact(artifact).unwrap_err();
+        assert!(err.to_string().contains("unsupported Quantum detached cosigner scheme"));
+    }
+
+    #[test]
+    fn detached_artifact_rejects_wrong_signature_length() {
+        let mut artifact = artifact_for(QUANTUM_DETACHED_SCHEME_P256, B256::ZERO);
+        artifact.signature = "0x1234".to_string();
+        let err = DetachedCosigner::from_artifact(artifact).unwrap_err();
+        assert!(err.to_string().contains("signature must be"));
+    }
+
+    #[test]
+    fn detached_cosigner_attach_fails_when_signing_hash_mismatches() {
+        let seed = parse_seed_file(&fixture_seed_path()).unwrap();
+        let request = simple_transfer_request(derive_address_from_seed(seed));
+        let wrong_hash = B256::repeat_byte(0xaa);
+        let cosigner = DetachedCosigner::from_artifact(artifact_for(
+            QUANTUM_DETACHED_SCHEME_P256,
+            wrong_hash,
+        ))
+        .unwrap();
+
+        let err = sign_quantum_write_request_with_cosigner(request, seed, Some(cosigner))
+            .unwrap_err();
+        assert!(err.to_string().contains("signing_hash does not match"));
+    }
+
+    #[test]
+    fn detached_p256_cosigner_is_attached_to_composite_signature() {
+        let seed = parse_seed_file(&fixture_seed_path()).unwrap();
+        let sender = derive_address_from_seed(seed);
+        let request = simple_transfer_request(sender);
+        let signing_hash = request.signature_hash();
+
+        let cosigner = DetachedCosigner::from_artifact(artifact_for(
+            QUANTUM_DETACHED_SCHEME_P256,
+            signing_hash,
+        ))
+        .unwrap();
+        let signed = sign_quantum_write_request_with_cosigner(
+            request.clone(),
+            seed,
+            Some(cosigner.clone()),
+        )
+        .unwrap();
+
+        let raw = &signed.raw_transaction;
+        assert_eq!(raw[0], QUANTUM_TX_TYPE_ID);
+        assert!(raw
+            .windows(1 + DETACHED_CLASSICAL_SIGNATURE_BYTES)
+            .any(|window| window[0] == QUANTUM_P256_SCHEME
+                && window[1..] == cosigner.signature));
+
+        let primary_only = sign_quantum_write_request(request, seed).unwrap();
+        assert!(signed.raw_transaction.len() > primary_only.raw_transaction.len());
+    }
+
+    #[test]
+    fn detached_ecdsa_cosigner_uses_ecdsa_scheme_byte() {
+        let seed = parse_seed_file(&fixture_seed_path()).unwrap();
+        let sender = derive_address_from_seed(seed);
+        let request = simple_transfer_request(sender);
+        let signing_hash = request.signature_hash();
+
+        let cosigner = DetachedCosigner::from_artifact(artifact_for(
+            QUANTUM_DETACHED_SCHEME_ECDSA,
+            signing_hash,
+        ))
+        .unwrap();
+        let signed =
+            sign_quantum_write_request_with_cosigner(request, seed, Some(cosigner.clone()))
+                .unwrap();
+
+        assert!(signed
+            .raw_transaction
+            .windows(1 + DETACHED_CLASSICAL_SIGNATURE_BYTES)
+            .any(|window| window[0] == QUANTUM_ECDSA_SCHEME
+                && window[1..] == cosigner.signature));
     }
 
     #[test]

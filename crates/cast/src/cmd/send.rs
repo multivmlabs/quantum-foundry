@@ -3,15 +3,18 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_ens::NameOrAddress;
 use alloy_network::{Ethereum, EthereumWallet, Network};
-use alloy_primitives::{Address, hex};
+use alloy_primitives::{Address, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder as AlloyProviderBuilder};
 use alloy_signer::{Signature, Signer};
 use clap::Parser;
 use eyre::{Result, eyre};
 use foundry_cli::{opts::TransactionOpts, utils::LoadConfig};
 use foundry_common::{
-    FoundryTransactionBuilder, QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS,
-    derive_primary_pubkey, parse_seed_file, sign_quantum_transaction_request,
+    DetachedCosigner, FoundryTransactionBuilder, QUANTUM_ADD_KEY_SELECTOR,
+    QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS, QUANTUM_LIFECYCLE_GAS_FLOOR,
+    QUANTUM_REMOVE_KEY_SELECTOR, QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE,
+    QUANTUM_UPDATE_KEY_AUTH_SELECTOR, derive_primary_pubkey, parse_seed_file,
+    sign_quantum_transaction_request_with_cosigner,
     fmt::{UIfmt, UIfmtReceiptExt},
     provider::ProviderBuilder,
 };
@@ -153,10 +156,33 @@ impl SendTxArgs {
             })?;
         let primary_seed = parse_seed_file(seed_path)?;
 
-        if quantum_send_requests_bootstrap(to.as_ref(), sig.as_deref())
-            && tx.quantum.init_primary_pubkey.is_none()
+        let cosigner = tx
+            .quantum
+            .cosigner_artifact
+            .as_deref()
+            .map(DetachedCosigner::from_artifact_file)
+            .transpose()?;
+
+        // Fail closed before any RPC simulation: ordinary `cast send` must not accept
+        // unsupported KeyVault lifecycle selectors (addKey / removeKey / updateKeyAuth).
+        // Only `bootstrapKey()` is supported from this path in v1.
+        if quantum_destination_is_keyvault(to.as_ref())
+            && quantum_input_is_unsupported_lifecycle(sig.as_deref())
         {
-            tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+            return Err(eyre!(QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE));
+        }
+
+        if quantum_send_requests_bootstrap(to.as_ref(), sig.as_deref()) {
+            if tx.quantum.init_primary_pubkey.is_none() {
+                tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+            }
+            // Bootstrap/lifecycle calls cannot be simulated via `eth_estimateGas` because
+            // the validator-published bootstrap transient state is absent. Apply the fixed
+            // lifecycle gas floor when the caller did not override it, mirroring
+            // `quantum-send-tx`'s LIFECYCLE_GAS_FLOOR.
+            if tx.gas_limit.is_none() {
+                tx.gas_limit = Some(U256::from(QUANTUM_LIFECYCLE_GAS_FLOOR));
+            }
         }
 
         let config = send_tx.eth.load_config()?;
@@ -174,7 +200,11 @@ impl SendTxArgs {
             .await?;
 
         let (tx_request, _) = builder.build(sender).await?;
-        let payload = sign_quantum_transaction_request(tx_request, primary_seed)?;
+        let payload = sign_quantum_transaction_request_with_cosigner(
+            tx_request,
+            primary_seed,
+            cosigner,
+        )?;
 
         let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
         let cast = CastTxSender::new(&provider);
@@ -441,6 +471,22 @@ fn quantum_input_is_bootstrap(input: Option<&str>) -> bool {
             .trim()
             .trim_start_matches("0x")
             .starts_with(&hex::encode(QUANTUM_BOOTSTRAP_SELECTOR))
+}
+
+fn quantum_input_is_unsupported_lifecycle(input: Option<&str>) -> bool {
+    let Some(input) = input else { return false };
+    let trimmed = input.trim();
+    if trimmed.starts_with("addKey(")
+        || trimmed.starts_with("removeKey(")
+        || trimmed.starts_with("updateKeyAuth(")
+    {
+        return true;
+    }
+    let hex_body = trimmed.trim_start_matches("0x").to_ascii_lowercase();
+    let add = hex::encode(QUANTUM_ADD_KEY_SELECTOR);
+    let remove = hex::encode(QUANTUM_REMOVE_KEY_SELECTOR);
+    let update = hex::encode(QUANTUM_UPDATE_KEY_AUTH_SELECTOR);
+    hex_body.starts_with(&add) || hex_body.starts_with(&remove) || hex_body.starts_with(&update)
 }
 
 pub(crate) async fn cast_send<N: Network, P: Provider<N>>(
