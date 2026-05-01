@@ -50,10 +50,21 @@ $ make pr
 - [Architecture](./architecture.md)
 - [Cheatcodes](./cheatcodes.md)
 - [Debugging](./debugging.md)
+- [Quantum Phase 0 Implementation Note](./quantum-phase0-implementation-note.md)
+- [Quantum Adapter Touchpoints](./quantum-adapter-touchpoints.md)
 - [Scripting](./scripting.md)
 - [Custom Network Features](./networks.md)
 
 _Note: This is incomplete and possibly outdated_
+
+## Quantum Fork Metadata
+
+The Quantum fork is currently frozen against upstream Foundry commit `f1abb2ca347187bb6dea8c3881ca44ce50aab1e7` for the Phase 0 seam spike and Phase 1 adapter work.
+
+Use these docs as the source of truth before rebasing or widening the adapter surface:
+
+- [Quantum Phase 0 Implementation Note](./quantum-phase0-implementation-note.md)
+- [Quantum Adapter Touchpoints](./quantum-adapter-touchpoints.md)
 
 ## Getting in Touch
 

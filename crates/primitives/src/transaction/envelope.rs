@@ -1,6 +1,6 @@
 use alloy_consensus::{
-    Sealed, Signed, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope, TxLegacy, TxType,
-    Typed2718,
+    Sealed, Signed, Transaction, TransactionEnvelope, TxEip1559, TxEip2930, TxEnvelope, TxLegacy,
+    TxType, Typed2718,
     crypto::RecoveryError,
     transaction::{
         SignerRecoverable, TxEip7702, TxHashRef,
@@ -17,6 +17,8 @@ use op_revm::{OpTransaction, transaction::deposit::DepositTransactionParts};
 use revm::context::TxEnv;
 use tempo_primitives::{AASigned, TempoTransaction};
 use tempo_revm::TempoTxEnv;
+
+use crate::{QUANTUM_TX_TYPE_ID, QuantumTxEnvelope};
 
 //
 /// Container type for signed, typed transactions.
@@ -61,6 +63,9 @@ pub enum FoundryTxEnvelope {
     /// See <https://docs.tempo.xyz/protocol/transactions>.
     #[envelope(ty = 0x76, typed = TempoTransaction)]
     Tempo(AASigned),
+    /// Quantum transaction type.
+    #[envelope(ty = 0x7a, typed = QuantumTxEnvelope)]
+    Quantum(QuantumTxEnvelope),
 }
 
 impl FoundryTxEnvelope {
@@ -76,6 +81,7 @@ impl FoundryTxEnvelope {
             Self::Eip7702(tx) => Ok(TxEnvelope::Eip7702(tx)),
             Self::Deposit(_) => Err(self),
             Self::Tempo(_) => Err(self),
+            Self::Quantum(_) => Err(self),
         }
     }
 
@@ -104,12 +110,18 @@ impl FoundryTxEnvelope {
             Self::Eip7702(t) => *t.hash(),
             Self::Deposit(t) => t.tx_hash(),
             Self::Tempo(t) => *t.hash(),
+            Self::Quantum(t) => *t.tx_hash(),
         }
     }
 
     /// Returns `true` if this is a Tempo transaction.
     pub const fn is_tempo(&self) -> bool {
         matches!(self, Self::Tempo(_))
+    }
+
+    /// Returns `true` if this is a Quantum transaction.
+    pub const fn is_quantum(&self) -> bool {
+        matches!(self, Self::Quantum(_))
     }
 
     /// Recovers the Ethereum address which was used to sign the transaction.
@@ -122,6 +134,7 @@ impl FoundryTxEnvelope {
             Self::Eip7702(tx) => tx.recover_signer()?,
             Self::Deposit(tx) => tx.from,
             Self::Tempo(tx) => tx.signature().recover_signer(&tx.signature_hash())?,
+            Self::Quantum(tx) => tx.recover_signer()?,
         })
     }
 }
@@ -136,6 +149,7 @@ impl TxHashRef for FoundryTxEnvelope {
             Self::Eip7702(t) => t.hash(),
             Self::Deposit(t) => t.hash_ref(),
             Self::Tempo(t) => t.hash(),
+            Self::Quantum(t) => t.tx_hash(),
         }
     }
 }
@@ -207,6 +221,29 @@ impl From<tempo_primitives::TempoTxEnvelope> for FoundryTxEnvelope {
     }
 }
 
+impl From<QuantumTxEnvelope> for FoundryTxEnvelope {
+    fn from(tx: QuantumTxEnvelope) -> Self {
+        Self::Quantum(tx)
+    }
+}
+
+fn quantum_to_tx_env(tx: &QuantumTxEnvelope, caller: Address) -> TxEnv {
+    TxEnv {
+        tx_type: tx.ty(),
+        caller,
+        gas_limit: tx.gas_limit(),
+        gas_price: tx.max_fee_per_gas(),
+        kind: tx.kind(),
+        value: tx.value(),
+        data: tx.input().clone(),
+        nonce: tx.nonce(),
+        chain_id: tx.chain_id(),
+        access_list: tx.access_list().cloned().unwrap_or_default().into(),
+        gas_priority_fee: tx.max_priority_fee_per_gas(),
+        ..Default::default()
+    }
+}
+
 impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
     type Error = ConversionError;
 
@@ -234,6 +271,17 @@ impl TryFrom<AnyRpcTransaction> for FoundryTxEnvelope {
 
                     return Ok(Self::Deposit(Sealed::new(deposit_tx)));
                 };
+
+                if tx.ty() == QUANTUM_TX_TYPE_ID {
+                    let quantum_tx =
+                        tx.inner.fields.deserialize_into::<QuantumTxEnvelope>().map_err(|e| {
+                            ConversionError::Custom(format!(
+                                "Failed to deserialize Quantum tx: {e}"
+                            ))
+                        })?;
+
+                    return Ok(Self::Quantum(quantum_tx));
+                }
 
                 let tx_type = tx.ty();
                 Err(ConversionError::Custom(format!("Unknown transaction type: 0x{tx_type:02X}")))
@@ -263,6 +311,7 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
                 }
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Ethereum context"),
+            FoundryTxEnvelope::Quantum(tx) => quantum_to_tx_env(tx, caller),
         }
     }
 }
@@ -309,6 +358,10 @@ impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
                 Self { base, enveloped_tx: None, deposit }
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
+            FoundryTxEnvelope::Quantum(tx) => {
+                let base = quantum_to_tx_env(tx, caller);
+                Self { base, enveloped_tx: None, deposit: Default::default() }
+            }
         }
     }
 }
@@ -339,6 +392,7 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TempoTxEnv {
             }
             FoundryTxEnvelope::Deposit(_) => unreachable!("Deposit tx in Tempo context"),
             FoundryTxEnvelope::Tempo(aa_signed) => Self::from_recovered_tx(aa_signed, caller),
+            FoundryTxEnvelope::Quantum(tx) => Self::from(quantum_to_tx_env(tx, caller)),
         }
     }
 }
@@ -403,6 +457,10 @@ impl FromTxWithEncoded<FoundryTxEnvelope> for OpTransaction<TxEnv> {
                 Self { base, enveloped_tx: Some(encoded), deposit }
             }
             FoundryTxEnvelope::Tempo(_) => unreachable!("Tempo tx in Optimism context"),
+            FoundryTxEnvelope::Quantum(tx) => {
+                let base = quantum_to_tx_env(tx, caller);
+                Self { base, enveloped_tx: Some(encoded), deposit: Default::default() }
+            }
         }
     }
 }
@@ -417,6 +475,7 @@ impl std::fmt::Display for FoundryTxType {
             Self::Eip7702 => write!(f, "eip7702"),
             Self::Deposit => write!(f, "deposit"),
             Self::Tempo => write!(f, "tempo"),
+            Self::Quantum => write!(f, "quantum"),
         }
     }
 }
@@ -443,6 +502,7 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
             FoundryTxEnvelope::Eip7702(signed_tx) => Self::Eip7702(signed_tx.strip_signature()),
             FoundryTxEnvelope::Deposit(sealed_tx) => Self::Deposit(sealed_tx.into_inner()),
             FoundryTxEnvelope::Tempo(signed_tx) => Self::Tempo(signed_tx.strip_signature()),
+            FoundryTxEnvelope::Quantum(signed_tx) => Self::Quantum(signed_tx),
         }
     }
 }

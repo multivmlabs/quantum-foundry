@@ -147,6 +147,7 @@ impl TransactionOpts {
 
         // set network-specific options
         self.tempo.apply::<N>(tx, self.nonce.map(|n| n.to()));
+        self.quantum.apply::<N>(tx);
     }
 }
 

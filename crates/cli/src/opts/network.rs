@@ -2,7 +2,7 @@ use alloy_chains::Chain;
 use alloy_primitives::ChainId;
 
 /// Network selection, defaulting to Ethereum
-#[derive(Clone, Debug, Default, clap::ValueEnum)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum NetworkVariant {
     /// Ethereum (default)
     #[default]
@@ -11,6 +11,8 @@ pub enum NetworkVariant {
     Optimism,
     /// Tempo
     Tempo,
+    /// Quantum
+    Quantum,
 }
 
 impl From<ChainId> for NetworkVariant {
@@ -21,7 +23,21 @@ impl From<ChainId> for NetworkVariant {
         } else if chain.is_optimism() {
             Self::Optimism
         } else {
+            // Quantum stays explicitly selected in v1; do not auto-infer it from chain ID here.
             Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_quantum_network_variant() {
+        assert_eq!(
+            <NetworkVariant as clap::ValueEnum>::from_str("quantum", true).unwrap(),
+            NetworkVariant::Quantum
+        );
     }
 }
