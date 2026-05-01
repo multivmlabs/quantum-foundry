@@ -20,7 +20,7 @@ use foundry_cli::{
     utils::{LoadConfig, TraceResult, parse_ether_value},
 };
 use foundry_common::{
-    FoundryTransactionBuilder, QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE,
+    FoundryTransactionBuilder, QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE, QUANTUM_KEYVAULT_ADDRESS,
     abi::{encode_function_args, get_func},
     provider::{ProviderBuilder, curl_transport::generate_curl_command},
     quantum_call_is_unsupported_lifecycle_calldata, sh_println, shell,
@@ -217,15 +217,19 @@ pub enum CallSubcommands {
 
 impl CallArgs {
     pub async fn run(self) -> Result<()> {
+        // `cast call` is a read path and must stay on ordinary RPC simulation.
+        // Quantum write-only options (`--quantum*`) and KeyVault lifecycle
+        // selectors cannot be simulated; reject them with an actionable error
+        // instead of letting them reach `eth_call`. Run the guard before the
+        // `--curl` branch so curl-mode emission cannot bypass the fail-closed
+        // policy. The guard is pure local validation and does not contact the
+        // provider. Name/ENS destinations are re-checked against their resolved
+        // address later in `run_with_network`; `run_curl` rejects names outright.
+        self.reject_quantum_read_path_misuse(None)?;
         // Handle --curl mode early, before any provider interaction
         if self.rpc.curl {
             return self.run_curl().await;
         }
-        // `cast call` is a read path and must stay on ordinary RPC simulation.
-        // Quantum write-only options (`--quantum*`) and KeyVault lifecycle
-        // selectors cannot be simulated; reject them with an actionable error
-        // instead of letting them reach `eth_call`.
-        self.reject_quantum_read_path_misuse()?;
         if self.tx.tempo.is_tempo() {
             self.run_with_network::<TempoEvmNetwork>().await
         } else {
@@ -251,8 +255,20 @@ impl CallArgs {
         let state_overrides = self.get_state_overrides()?;
         let block_overrides = self.get_block_overrides()?;
 
+        let provider = ProviderBuilder::<FEN::Network>::from_config(&config)?.build()?;
+
+        // Resolve the destination up front so the lifecycle fence observes the
+        // true address, not an unresolved name/ENS target that happens to map
+        // to `QUANTUM_KEYVAULT_ADDRESS`. Without this, a name resolving to the
+        // KeyVault would bypass the fail-closed check and reach `eth_call`.
+        let resolved_to = match self.to.clone() {
+            Some(to) => Some(to.resolve(&provider).await?),
+            None => None,
+        };
+        self.reject_quantum_read_path_misuse(resolved_to)?;
+
         let Self {
-            to,
+            to: _,
             mut sig,
             mut args,
             mut tx,
@@ -274,7 +290,6 @@ impl CallArgs {
             sig = Some(data);
         }
 
-        let provider = ProviderBuilder::<FEN::Network>::from_config(&config)?.build()?;
         let sender = SenderKind::from_wallet_opts(wallet).await?;
         let from = sender.address();
 
@@ -297,7 +312,7 @@ impl CallArgs {
 
         let (tx, func) = CastTxBuilder::new(&provider, tx, &config)
             .await?
-            .with_to(to)
+            .with_to(resolved_to.map(NameOrAddress::Address))
             .await?
             .with_code_sig_and_args(code, sig, args)
             .await?
@@ -491,11 +506,32 @@ impl CallArgs {
 
     /// Fail closed when `cast call` is invoked with Quantum write-only options or
     /// against a KeyVault lifecycle selector.
-    fn reject_quantum_read_path_misuse(&self) -> Result<()> {
+    ///
+    /// `resolved_to` lets callers pass a post-name-resolution destination so a
+    /// name that resolves to `QUANTUM_KEYVAULT_ADDRESS` cannot bypass the
+    /// lifecycle fence by slipping through ENS/Etherscan lookup before
+    /// `eth_call`. When `None`, only literal-address forms of the destination
+    /// are checked (suitable for the early, pre-provider guard).
+    fn reject_quantum_read_path_misuse(&self, resolved_to: Option<Address>) -> Result<()> {
         if self.tx.quantum.is_quantum() {
             eyre::bail!(
                 "`cast call` does not support Quantum write-only flags (--quantum*); use `cast call` without them for reads, or `cast quantum` / `cast send --quantum` for writes"
             );
+        }
+        // Only reject KeyVault lifecycle selectors when the destination is the
+        // KeyVault precompile. An unrelated contract with a colliding selector
+        // must not be blocked.
+        if !self.destination_is_keyvault(resolved_to) {
+            return Ok(());
+        }
+        // Bare function names (no parentheses, no hex) are resolved later via
+        // Etherscan in `parse_function_args`. Catch lifecycle names locally so
+        // they cannot bypass the deterministic rejection by falling through to
+        // ABI lookup or `eth_call`.
+        if let Some(sig) = &self.sig
+            && quantum_call_sig_is_unsupported_lifecycle_bare_name(sig)
+        {
+            eyre::bail!(QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE);
         }
         let calldata = self.read_path_calldata()?;
         if let Some(bytes) = calldata
@@ -504,6 +540,19 @@ impl CallArgs {
             eyre::bail!(QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE);
         }
         Ok(())
+    }
+
+    fn destination_is_keyvault(&self, resolved_to: Option<Address>) -> bool {
+        if resolved_to == Some(QUANTUM_KEYVAULT_ADDRESS) {
+            return true;
+        }
+        match self.to.as_ref() {
+            Some(NameOrAddress::Address(addr)) => *addr == QUANTUM_KEYVAULT_ADDRESS,
+            Some(NameOrAddress::Name(name)) => {
+                Address::from_str(name).ok() == Some(QUANTUM_KEYVAULT_ADDRESS)
+            }
+            None => false,
+        }
     }
 
     /// Decode the `--data`/`sig` input for read-path selector checks. Returns
@@ -518,11 +567,8 @@ impl CallArgs {
             if let Some(hex_body) = trimmed.strip_prefix("0x").or_else(|| {
                 // Some callers pass a bare hex string without `0x`; treat short
                 // inputs that start with a known selector as already-encoded.
-                if trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                    Some(trimmed)
-                } else {
-                    None
-                }
+                (trimmed.len() >= 8 && trimmed.chars().all(|c| c.is_ascii_hexdigit()))
+                    .then_some(trimmed)
             }) && let Ok(bytes) = hex::decode(hex_body)
             {
                 return Ok(Some(bytes));
@@ -647,6 +693,17 @@ fn address_slot_value_override(address_override: &str) -> Result<(Address, U256,
         captures[2].parse()?, // Slot (U256)
         captures[3].parse()?, // Value (U256)
     ))
+}
+
+/// Return `true` when `sig` names a KeyVault lifecycle selector without
+/// parentheses. `cast call` would otherwise resolve these bare names through
+/// Etherscan in `parse_function_args`, bypassing the deterministic rejection.
+fn quantum_call_sig_is_unsupported_lifecycle_bare_name(sig: &str) -> bool {
+    let trimmed = sig.trim();
+    if trimmed.contains('(') {
+        return false;
+    }
+    matches!(trimmed, "bootstrapKey" | "addKey" | "removeKey" | "updateKeyAuth")
 }
 
 #[cfg(test)]
@@ -855,7 +912,7 @@ mod tests {
             "--data",
             "0x5e8e7a13",
         ]);
-        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        let err = args.reject_quantum_read_path_misuse(None).unwrap_err();
         assert!(
             err.to_string().contains("cannot be simulated via eth_call"),
             "unexpected error: {err}"
@@ -869,7 +926,7 @@ mod tests {
             "0x0000000000000000000000000000000000001000",
             "0x32bc2919",
         ]);
-        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        let err = args.reject_quantum_read_path_misuse(None).unwrap_err();
         assert!(
             err.to_string().contains("cannot be simulated via eth_call"),
             "unexpected error: {err}"
@@ -885,7 +942,7 @@ mod tests {
             "balanceOf(address)",
             "0x000000000000000000000000000000000000dEaD",
         ]);
-        let err = args.reject_quantum_read_path_misuse().unwrap_err();
+        let err = args.reject_quantum_read_path_misuse(None).unwrap_err();
         assert!(
             err.to_string().contains("does not support Quantum write-only flags"),
             "unexpected error: {err}"
@@ -900,7 +957,36 @@ mod tests {
             "balanceOf(address)",
             "0x000000000000000000000000000000000000dEaD",
         ]);
-        args.reject_quantum_read_path_misuse().expect("ordinary reads must not be rejected");
+        args.reject_quantum_read_path_misuse(None).expect("ordinary reads must not be rejected");
+    }
+
+    #[test]
+    fn cast_call_allows_colliding_selector_on_non_keyvault_destination() {
+        // Unrelated contract with a selector that happens to collide with a
+        // KeyVault lifecycle selector (0x32bc2919 = addKey) must NOT be
+        // rejected on the read path when `to` is not the KeyVault address.
+        let args = CallArgs::parse_from([
+            "foundry-cli",
+            "0xDeaDBeeFcAfEbAbEfAcEfEeDcBaDbEeFcAfEbAbE",
+            "--data",
+            "0x32bc2919",
+        ]);
+        args.reject_quantum_read_path_misuse(None)
+            .expect("colliding selector on non-KeyVault destination must not be rejected");
+    }
+
+    #[test]
+    fn cast_call_rejects_resolved_keyvault_name_for_lifecycle_selector() {
+        // A name destination that resolves to QUANTUM_KEYVAULT_ADDRESS must be
+        // rejected when the caller passes the resolved address into the fence.
+        // This protects against name/ENS destinations bypassing the read-path
+        // guard and reaching `eth_call` with an unsupported lifecycle selector.
+        let args = CallArgs::parse_from(["foundry-cli", "keyvault.eth", "--data", "0x32bc2919"]);
+        let err = args.reject_quantum_read_path_misuse(Some(QUANTUM_KEYVAULT_ADDRESS)).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be simulated via eth_call"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -933,5 +1019,17 @@ mod tests {
         assert_eq!(args.tx.nonce, Some(U64::from(42)));
         assert_eq!(args.tx.value, Some(U256::from(1000000000000000000u64)));
         assert_eq!(args.tx.blob_gas_price, Some(U256::from(10000000000u64)));
+    }
+
+    #[test]
+    fn bare_lifecycle_names_match_read_path_rejection() {
+        assert!(quantum_call_sig_is_unsupported_lifecycle_bare_name("bootstrapKey"));
+        assert!(quantum_call_sig_is_unsupported_lifecycle_bare_name("addKey"));
+        assert!(quantum_call_sig_is_unsupported_lifecycle_bare_name("removeKey"));
+        assert!(quantum_call_sig_is_unsupported_lifecycle_bare_name("updateKeyAuth"));
+        // Parenthesized signatures are handled by `read_path_calldata`, not here.
+        assert!(!quantum_call_sig_is_unsupported_lifecycle_bare_name("addKey(uint32)"));
+        // Unrelated bare names must not be treated as lifecycle calls.
+        assert!(!quantum_call_sig_is_unsupported_lifecycle_bare_name("balanceOf"));
     }
 }

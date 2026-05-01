@@ -238,7 +238,7 @@ fn quantum_to_tx_env(tx: &QuantumTxEnvelope, caller: Address) -> TxEnv {
         data: tx.input().clone(),
         nonce: tx.nonce(),
         chain_id: tx.chain_id(),
-        access_list: tx.access_list().cloned().unwrap_or_default().into(),
+        access_list: tx.access_list().cloned().unwrap_or_default(),
         gas_priority_fee: tx.max_priority_fee_per_gas(),
         ..Default::default()
     }

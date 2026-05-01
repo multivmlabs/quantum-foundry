@@ -16,8 +16,10 @@ Use this together with `quantum-phase0-implementation-note.md` when widening the
 
 These files are already intentionally diverged from upstream as part of the Phase 0 seam spike or the landed Phase 1 adapter work.
 
-- `.github/workflows/ci-tempo.yml`
-  - carries the frozen Quantum fork base and harness commit in CI metadata
+- `.github/workflows/ci-quantum.yml`
+  - Quantum-named workflow running `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and a targeted Quantum fixture regression job; carries the frozen Quantum fork base and harness commit in CI metadata
+- `README.md`
+  - Quantum-first project intro on top of the preserved upstream Foundry README, listing the `cast send --quantum`, `cast quantum` lifecycle subcommands, `cast call` lifecycle rejection, `forge create --quantum`, and scripted broadcast changeset
 - `docs/dev/README.md`
   - indexes the Quantum implementation note and this touchpoint manifest
 - `docs/dev/quantum-phase0-implementation-note.md`

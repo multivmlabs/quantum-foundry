@@ -1,3 +1,102 @@
+<br>
+<br>
+
+<p align="center">
+  <a href="https://quantum.systems">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://quantum.systems/images/logo-white.svg">
+      <img alt="tempo combomark" src="https://quantum.systems/images/logo-white.svg" width="auto" height="120">
+    </picture>
+  </a>
+</p>
+
+<br>
+<br>
+
+# Quantum Foundry
+
+Quantum is a post-quantum-ready EVM execution environment with a dedicated native transaction type (`0x7A`), explicit account lanes, and an ML-DSA-44 primary signer with optional detached classical cosigners.
+
+`Quantum Foundry` is a custom fork of [Foundry](https://github.com/foundry-rs/foundry) that integrates Quantum's native envelope, KeyVault lifecycle UX, and detached-cosigner contract directly into the familiar Foundry developer workflow.
+
+This fork is a drop-in replacement for upstream Foundry while Quantum-specific features are being stabilized; it tracks Foundry commit `f1abb2ca347187bb6dea8c3881ca44ce50aab1e7` and the Quantum harness commit `8f3612c60f9fa66ea3a09eab99a2e0802f373673`. See [`docs/dev/quantum-phase0-implementation-note.md`](./docs/dev/quantum-phase0-implementation-note.md) for the frozen RPC, signer, and ABI contract.
+
+## Installation
+
+```sh
+curl -L https://raw.githubusercontent.com/multivmlabs/quantum-foundry/HEAD/foundryup/install | bash
+foundryup --network quantum
+```
+
+This installs the Quantum-enabled `forge`, `cast`, `anvil`, and `chisel` from this fork's GitHub Releases into `~/.foundry-quantum/bin/`. The separate directory means quantum-foundry coexists with an existing upstream Foundry install at `~/.foundry/` — neither installer overwrites the other's binaries. If both are on your `PATH`, the one listed earlier wins for commands like `forge` and `cast`.
+
+<details>
+<summary>Building from source (contributors and unsupported platforms)</summary>
+
+```sh
+cargo build --release -p forge -p cast -p anvil -p chisel
+```
+
+The `target/release` binaries are drop-in replacements for upstream `forge`, `cast`, `anvil`, and `chisel`.
+
+</details>
+
+## Devnet
+
+Quantum's public devnet is available for early testing. **Note: the devnet is unstable — state may be wiped, chain ID may change, and downtime should be expected. A public testnet is targeted for mid-2026.**
+
+| Property           | Value                                 |
+| ------------------ | ------------------------------------- |
+| **Network Name**   | Quantum Devnet                        |
+| **Chain ID**       | `1337`                                |
+| **HTTP URL**       | `https://devnet2.rpc.quantum.systems` |
+| **Block Explorer** | `https://quantumscan.org/`            |
+
+Example:
+
+```sh
+cast block-number --rpc-url https://devnet2.rpc.quantum.systems
+```
+
+## Changeset
+
+Key Quantum extensions on top of upstream Foundry:
+
+- In `cast send`:
+  - `--quantum`: opt into the explicit Quantum adapter path (selection is explicit in v1, not inferred from chain ID).
+  - `--quantum.sender <ADDRESS>`: explicit Quantum account-lane address. Quantum writes never auto-derive the sender from the signing key.
+  - `--quantum.key-id <KEY_ID>`: account-lane key ID; defaults to `0` for ordinary v1 flows.
+  - `--quantum.primary-seed-file <PATH>`: canonical v1 ML-DSA-44 signer seed (single 32-byte hex seed, with or without `0x`).
+  - `--quantum.cosigner-artifact <PATH>`: optional detached v1 cosigner artifact JSON; schemes `p256` and `ecdsa` are supported and the artifact's `signing_hash` must match the fork-computed Quantum signing hash byte-for-byte.
+  - KeyVault lifecycle selectors (`bootstrapKey`, `addKey`, `removeKey`, `updateKeyAuth`) are rejected by the `cast send` pre-build guard and must be submitted through `cast quantum` instead.
+
+- In `cast quantum` (new subcommand group for KeyVault lifecycle UX):
+  - `cast quantum bootstrap`: primary-only `bootstrapKey()` through the shared `0x7A` signing pipeline.
+  - `cast quantum add-key`: `addKey(...)` with `--auth-key-id` (signer lane) distinct from `--target-key-id` (entry being added) so the two lanes cannot be confused.
+  - `cast quantum remove-key`: `removeKey(uint32)`.
+  - `cast quantum update-key-auth`: `updateKeyAuth(...)` with the same auth-lane / target-lane separation.
+  - All lifecycle writes auto-apply the fixed `QUANTUM_LIFECYCLE_GAS_FLOOR` (2,100,000) because validator-published transient state cannot be reproduced by `eth_estimateGas`.
+
+- In `cast call`:
+  - Fails closed on KeyVault lifecycle selectors with the frozen `QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE`, preserving ordinary read paths on standard RPC simulation.
+
+- In `forge create`:
+  - `--quantum` and the `--quantum.*` flags route CREATE through the shared Quantum adapter with the same explicit sender / key-id / seed / cosigner contract as `cast send`.
+
+- In `forge script`:
+  - Scripted broadcast routes through the shared Quantum adapter for supported write shapes and fails closed on unsupported Quantum script shapes with a stable rejection message.
+
+- Additionally:
+  - A shared `QuantumWriteRequestV1` write contract with fail-closed v1 validation: `nonce_key` must be `0`, multi-call bundles are rejected, and lifecycle-selector misuse is caught before signing.
+  - Detached cosigner artifact v1 (`version = 1`, `scheme`, `signing_hash`, `public_key`, `signature`) with composite-signature RLP layout using scheme bytes `0x01` (ML-DSA), `0x02` (P256), `0x03` (ECDSA).
+  - KeyVault lifecycle calldata builders derived from a shared `sol!` interface whose selectors are asserted byte-for-byte against the Phase 0 frozen constants.
+  - A pinned golden fixture (`testdata/fixtures/quantum/phase0/raw-send-primary.json`) that locks the raw `0x7A` envelope bytes end-to-end.
+
+See [`docs/dev/quantum-adapter-touchpoints.md`](./docs/dev/quantum-adapter-touchpoints.md) for the full manifest of Quantum-modified files.
+
+<br>
+<br>
+
 <div align="center">
   <img src=".github/assets/banner.png" alt="Foundry banner" />
 

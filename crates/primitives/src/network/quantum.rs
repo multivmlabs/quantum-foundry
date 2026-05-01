@@ -48,7 +48,7 @@ impl Typed2718 for QuantumTxType {
 
 impl From<QuantumTxType> for u8 {
     fn from(value: QuantumTxType) -> Self {
-        value as u8
+        value as Self
     }
 }
 
@@ -114,8 +114,8 @@ impl From<QuantumTxEnvelope> for QuantumTransactionRequest {
             sender: Some(value.sender),
             key_id: Some(value.key_id),
             nonce_key: Some(value.nonce_key),
-            init_primary_pubkey: value.init_primary_pubkey.clone(),
-            init_cosigner_pubkey: value.init_cosigner_pubkey.clone(),
+            init_primary_pubkey: value.init_primary_pubkey,
+            init_cosigner_pubkey: value.init_cosigner_pubkey,
         }
     }
 }
@@ -379,15 +379,29 @@ fn encode_empty_list(out: &mut dyn BufMut) {
     RlpHeader { list: true, payload_length: 0 }.encode(out);
 }
 
+fn decode_empty_list(buf: &mut &[u8]) -> alloy_rlp::Result<()> {
+    let header = RlpHeader::decode(buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    if header.payload_length != 0 {
+        return Err(alloy_rlp::Error::Custom("expected empty list for reserved field"));
+    }
+    Ok(())
+}
+
 fn encode_optional_list_bytes(value: Option<&Bytes>, out: &mut dyn BufMut) {
     match value {
-        Some(value) => value.as_ref().encode(out),
+        // Preserve the raw RLP list framing produced by `decode_list_bytes`.
+        // `<[u8] as Encodable>::encode` would re-wrap with a string header and
+        // break decode→encode idempotence (changes tx hash).
+        Some(value) => out.put_slice(value.as_ref()),
         None => encode_empty_list(out),
     }
 }
 
 fn optional_list_bytes_length(value: Option<&Bytes>) -> usize {
-    value.map_or(1, Encodable::length)
+    value.map_or(1, |v| v.len())
 }
 
 fn decode_optional_list_bytes(buf: &mut &[u8]) -> alloy_rlp::Result<Option<Bytes>> {
@@ -406,6 +420,51 @@ fn decode_list_bytes(buf: &mut &[u8]) -> alloy_rlp::Result<Bytes> {
     let raw = Bytes::copy_from_slice(&start[..total_len]);
     *buf = &start[total_len..];
     Ok(raw)
+}
+
+/// Encode an optional pubkey as `list(string(bytes))`, matching the signing-path
+/// encoding in `QuantumWriteRequestV1`. Paired with `decode_option_pubkey_list`,
+/// which strips the outer list + inner string framing so stored bytes carry
+/// pubkey payload only.
+fn encode_option_pubkey_list(value: Option<&Bytes>, out: &mut dyn BufMut) {
+    match value {
+        Some(value) => {
+            let payload_length = value.length();
+            RlpHeader { list: true, payload_length }.encode(out);
+            value.encode(out);
+        }
+        None => encode_empty_list(out),
+    }
+}
+
+fn option_pubkey_list_length(value: Option<&Bytes>) -> usize {
+    match value {
+        Some(value) => {
+            let payload_length = value.length();
+            alloy_rlp::length_of_length(payload_length) + payload_length
+        }
+        None => 1,
+    }
+}
+
+fn decode_option_pubkey_list(buf: &mut &[u8]) -> alloy_rlp::Result<Option<Bytes>> {
+    let header = RlpHeader::decode(buf)?;
+    if !header.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    if header.payload_length == 0 {
+        return Ok(None);
+    }
+    let start_len = buf.len();
+    let pubkey = Bytes::decode(buf)?;
+    let consumed = start_len - buf.len();
+    if consumed != header.payload_length {
+        return Err(alloy_rlp::Error::ListLengthMismatch {
+            expected: header.payload_length,
+            got: consumed,
+        });
+    }
+    Ok(Some(pubkey))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -462,19 +521,20 @@ struct QuantumTxEnvelopeSerde {
 }
 
 impl QuantumTxEnvelope {
-    pub fn sender(&self) -> Address {
+    pub const fn sender(&self) -> Address {
         self.sender
     }
 
-    pub fn key_id(&self) -> u32 {
+    pub const fn key_id(&self) -> u32 {
         self.key_id
     }
 
-    pub fn nonce_key(&self) -> U256 {
+    pub const fn nonce_key(&self) -> U256 {
         self.nonce_key
     }
 
-    pub fn from_signed_parts(
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_signed_parts(
         chain_id: ChainId,
         sender: Address,
         nonce_key: U256,
@@ -524,8 +584,8 @@ impl QuantumTxEnvelope {
             + self.access_list.length()
             + 1
             + 1
-            + optional_list_bytes_length(self.init_primary_pubkey.as_ref())
-            + optional_list_bytes_length(self.init_cosigner_pubkey.as_ref())
+            + option_pubkey_list_length(self.init_primary_pubkey.as_ref())
+            + option_pubkey_list_length(self.init_cosigner_pubkey.as_ref())
     }
 
     fn encode_fields(&self, out: &mut dyn BufMut) {
@@ -541,8 +601,8 @@ impl QuantumTxEnvelope {
         self.access_list.encode(out);
         encode_empty_list(out);
         encode_empty_list(out);
-        encode_optional_list_bytes(self.init_primary_pubkey.as_ref(), out);
-        encode_optional_list_bytes(self.init_cosigner_pubkey.as_ref(), out);
+        encode_option_pubkey_list(self.init_primary_pubkey.as_ref(), out);
+        encode_option_pubkey_list(self.init_cosigner_pubkey.as_ref(), out);
     }
 
     fn encode_inner(&self, out: &mut dyn BufMut) {
@@ -552,8 +612,14 @@ impl QuantumTxEnvelope {
     }
 
     fn inner_length(&self) -> usize {
+        // `sender_sig` is stored as the raw RLP list bytes produced by
+        // `decode_list_bytes`, and `encode_inner` writes it back unchanged via
+        // `put_slice`. Use the raw byte length here so the outer list header
+        // matches what is actually emitted; `Bytes::length()` would re-add an
+        // RLP string header and break decode→encode byte stability (and the
+        // resulting tx hash).
         self.encoded_fields_length()
-            + self.sender_sig.length()
+            + self.sender_sig.len()
             + optional_list_bytes_length(self.fee_payer_sig.as_ref())
     }
 
@@ -576,11 +642,23 @@ impl QuantumTxEnvelope {
         let gas_limit = u64::decode(buf)?;
         let call = decode_single_call_list(buf)?;
         let access_list = AccessList::decode(buf)?;
-        let _fee_payer = decode_optional_list_bytes(buf)?;
-        let _fee_payer_key_id = decode_optional_list_bytes(buf)?;
-        let init_primary_pubkey = decode_optional_list_bytes(buf)?;
-        let init_cosigner_pubkey = decode_optional_list_bytes(buf)?;
+        // Reserved fee-payer placeholders are always encoded as empty lists.
+        // Reject non-empty values so decode→re-encode cannot silently change
+        // the envelope hash.
+        decode_empty_list(buf)?;
+        decode_empty_list(buf)?;
+        let init_primary_pubkey = decode_option_pubkey_list(buf)?;
+        let init_cosigner_pubkey = decode_option_pubkey_list(buf)?;
         let sender_sig = decode_list_bytes(buf)?;
+        // `decode_list_bytes` returns the raw outer-list framing, so an empty
+        // RLP list (`0xc0`) is stored as `Bytes([0xc0])` rather than empty
+        // bytes. The composite signature payload is non-empty by construction,
+        // so reject the empty-list marker here — otherwise the structural
+        // `is_empty()` guard in `recover_signer` would let a structurally
+        // empty signature through.
+        if sender_sig.len() == 1 && sender_sig[0] == alloy_rlp::EMPTY_LIST_CODE {
+            return Err(alloy_rlp::Error::Custom("sender_sig must be non-empty"));
+        }
         let fee_payer_sig = decode_optional_list_bytes(buf)?;
 
         Ok(Self::from_signed_parts(
@@ -824,12 +902,31 @@ impl Decodable2718 for QuantumTxEnvelope {
     }
 }
 
+// ML-DSA signatures are not recoverable the way secp256k1 is: verification
+// requires the sender's registered post-quantum pubkey, which lives in the
+// Quantum KeyVault on-chain state and is only reachable from the execution
+// node. The envelope therefore carries `sender` explicitly and signature
+// verification is performed at execution time by the node. These impls
+// return the declared sender — matching the upstream precedent for other
+// non-ECDSA envelopes such as `OpTxEnvelope::Deposit` — after a cheap
+// structural check that `sender_sig` is non-empty, which rejects trivially
+// malformed envelopes without pretending to do cryptographic verification.
 impl SignerRecoverable for QuantumTxEnvelope {
     fn recover_signer(&self) -> Result<Address, alloy_consensus::crypto::RecoveryError> {
+        if self.sender_sig.is_empty()
+            || (self.sender_sig.len() == 1 && self.sender_sig[0] == alloy_rlp::EMPTY_LIST_CODE)
+        {
+            return Err(alloy_consensus::crypto::RecoveryError::new());
+        }
         Ok(self.sender)
     }
 
     fn recover_signer_unchecked(&self) -> Result<Address, alloy_consensus::crypto::RecoveryError> {
+        if self.sender_sig.is_empty()
+            || (self.sender_sig.len() == 1 && self.sender_sig[0] == alloy_rlp::EMPTY_LIST_CODE)
+        {
+            return Err(alloy_consensus::crypto::RecoveryError::new());
+        }
         Ok(self.sender)
     }
 }
@@ -1029,13 +1126,14 @@ impl RecommendedFillers for QuantumNetwork {
 
 #[cfg(test)]
 mod tests {
+    use alloy_network::ReceiptResponse as _;
     use alloy_provider::network::eip2718::Decodable2718 as _;
 
     use super::*;
 
     fn raw_fixture() -> serde_json::Value {
         serde_json::from_str(include_str!(
-            "../../../testdata/fixtures/quantum/phase0/raw-send-primary.json"
+            "../../../../testdata/fixtures/quantum/phase0/raw-send-primary.json"
         ))
         .unwrap()
     }
@@ -1048,9 +1146,104 @@ mod tests {
         let tx = QuantumTxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
 
         assert_eq!(tx.ty(), QUANTUM_TX_TYPE_ID);
-        assert_eq!(tx.sender(), value["sender"].as_str().unwrap().parse().unwrap());
+        let expected_sender: Address = value["sender"].as_str().unwrap().parse().unwrap();
+        assert_eq!(tx.sender(), expected_sender);
         assert_eq!(tx.key_id(), value["key_id"].as_u64().unwrap() as u32);
         assert_eq!(tx.nonce_key(), U256::ZERO);
+    }
+
+    #[test]
+    fn phase0_raw_transaction_round_trips_byte_for_byte() {
+        // Decode → re-encode must reproduce the exact wire bytes (and hash) so
+        // the envelope's outer list length is consistent with its body. This
+        // is the regression for the `inner_length` vs `encode_inner` mismatch
+        // on `sender_sig` framing.
+        let value = raw_fixture();
+        let raw = value["raw_transaction"].as_str().unwrap();
+        let expected_bytes = alloy_primitives::hex::decode(raw).unwrap();
+        let expected_hash: B256 = value["raw_transaction_hash"].as_str().unwrap().parse().unwrap();
+
+        let tx = QuantumTxEnvelope::decode_2718(&mut expected_bytes.as_slice()).unwrap();
+
+        let mut reencoded = Vec::with_capacity(expected_bytes.len());
+        tx.encode_2718(&mut reencoded);
+        assert_eq!(reencoded, expected_bytes, "decode→encode is not byte-stable");
+        assert_eq!(keccak256(&reencoded), expected_hash);
+        assert_eq!(*tx.tx_hash(), expected_hash);
+    }
+
+    #[test]
+    fn recover_signer_rejects_empty_sender_sig() {
+        // ML-DSA signatures are not recoverable, so `recover_signer` returns
+        // the declared sender — but it must refuse envelopes whose sender
+        // signature payload is structurally empty. Authoritative verification
+        // still happens at execution by the Quantum node via KeyVault state.
+        let envelope = QuantumTxEnvelope::from_signed_parts(
+            1337,
+            Address::repeat_byte(0x11),
+            U256::ZERO,
+            0,
+            0,
+            1,
+            1,
+            21_000,
+            TxKind::Call(Address::repeat_byte(0x22)),
+            U256::ZERO,
+            Bytes::new(),
+            AccessList::default(),
+            None,
+            None,
+            Bytes::new(),
+            None,
+        );
+
+        assert!(envelope.recover_signer().is_err());
+        assert!(envelope.recover_signer_unchecked().is_err());
+
+        let mut envelope = envelope;
+        envelope.sender_sig = Bytes::from_static(&[alloy_rlp::EMPTY_LIST_CODE]);
+        assert!(envelope.recover_signer().is_err());
+        assert!(envelope.recover_signer_unchecked().is_err());
+    }
+
+    #[test]
+    fn decode_rejects_empty_list_sender_sig() {
+        // `decode_list_bytes` returns the raw outer-list framing, so a wire
+        // envelope carrying `sender_sig = 0xc0` (empty RLP list) would land
+        // in the field as `Bytes([0xc0])` and bypass the `is_empty()` guard
+        // in `recover_signer`. Decode must reject the empty-list marker so
+        // a structurally empty signature cannot reach the recovery path.
+        let mut fixture_envelope = {
+            let bytes =
+                alloy_primitives::hex::decode(raw_fixture()["raw_transaction"].as_str().unwrap())
+                    .unwrap();
+            QuantumTxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap()
+        };
+        fixture_envelope.sender_sig = Bytes::from_static(&[alloy_rlp::EMPTY_LIST_CODE]);
+        fixture_envelope.hash = OnceLock::new();
+
+        let mut buf = Vec::new();
+        fixture_envelope.encode_2718(&mut buf);
+
+        let err = QuantumTxEnvelope::decode_2718(&mut buf.as_slice())
+            .expect_err("decode must reject empty-list sender_sig");
+        assert!(matches!(err, Eip2718Error::RlpError(_)), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn envelope_bootstrap_pubkey_round_trips_to_request_as_semantic_bytes() {
+        // Exercise the decoded envelope path by round-tripping the phase-0
+        // fixture, which has `init_primary_pubkey = None`, and confirm the
+        // request view also sees `None` (not the raw RLP empty-list marker).
+        let fixture = raw_fixture();
+        let raw = fixture["raw_transaction"].as_str().unwrap();
+        let bytes = alloy_primitives::hex::decode(raw).unwrap();
+        let decoded = QuantumTxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        assert!(decoded.init_primary_pubkey.is_none());
+
+        let request: QuantumTransactionRequest = decoded.into();
+        assert!(request.init_primary_pubkey.is_none());
+        assert!(request.init_cosigner_pubkey.is_none());
     }
 
     #[test]
@@ -1073,6 +1266,27 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let decoded: QuantumTransactionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn decode_empty_list_rejects_non_empty_reserved_placeholder() {
+        // The canonical encoder writes reserved fee-payer placeholder fields
+        // as empty lists. `decode_empty_list` must reject any other list so
+        // decode→re-encode cannot silently change the envelope hash.
+        let empty = [alloy_rlp::EMPTY_LIST_CODE];
+        assert!(decode_empty_list(&mut empty.as_ref()).is_ok());
+
+        // `list(string(0x80))`: outer list header `0xc1` followed by empty string `0x80`.
+        let non_empty = [0xc1u8, 0x80u8];
+        let err = decode_empty_list(&mut non_empty.as_ref())
+            .expect_err("non-empty list must be rejected");
+        assert!(format!("{err}").contains("reserved"), "unexpected error: {err}");
+
+        // A string (non-list) must also be rejected.
+        let string_bytes = [0x80u8];
+        let err =
+            decode_empty_list(&mut string_bytes.as_ref()).expect_err("string must be rejected");
+        assert!(matches!(err, alloy_rlp::Error::UnexpectedString));
     }
 
     #[test]

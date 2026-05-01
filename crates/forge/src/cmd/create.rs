@@ -19,9 +19,9 @@ use foundry_common::{
     DetachedCosigner, FoundryTransactionBuilder,
     compile::{self},
     fmt::parse_tokens,
-    parse_seed_file, sign_quantum_transaction_request_with_cosigner,
+    parse_seed_file,
     provider::ProviderBuilder,
-    shell,
+    shell, sign_quantum_transaction_request_with_cosigner,
 };
 use foundry_compilers::{
     ArtifactId, artifacts::BytecodeObject, info::ContractInfo, utils::canonicalize,
@@ -128,6 +128,13 @@ impl CreateArgs {
         if self.tx.tempo.is_tempo() {
             return Err(eyre!("Quantum and Tempo options cannot be combined"));
         }
+        // Blob flags are applied through the shared `TransactionOpts`, but the
+        // Quantum transaction builder leaves blob setters on their default
+        // no-op implementations, so these flags would be silently dropped
+        // rather than encoded into the 0x7A envelope.
+        if self.tx.blob || self.tx.eip4844 || self.tx.blob_gas_price.is_some() {
+            return Err(eyre!("the Quantum adapter path does not support blob transactions"));
+        }
 
         let sender = self
             .tx
@@ -135,6 +142,15 @@ impl CreateArgs {
             .sender
             .ok_or_else(|| eyre!("--quantum.sender is required for Quantum writes"))?;
         validate_quantum_sender(self.eth.wallet.from, sender)?;
+
+        // Quantum v1 does not carry EIP-7702 authorization lists in the signed
+        // 0x7a envelope. Reject `--auth` explicitly so callers do not believe a
+        // 7702 auth is being broadcast when it would be silently dropped.
+        if !self.tx.auth.is_empty() {
+            return Err(eyre!(
+                "the Quantum adapter path does not support EIP-7702 `--auth`; the v1 envelope does not carry authorization lists"
+            ));
+        }
 
         let primary_seed = if self.broadcast {
             let path = self.tx.quantum.primary_seed_file.as_ref().ok_or_else(|| {
@@ -690,7 +706,13 @@ impl CreateArgs {
                     e
                 }
             })?;
-        let is_legacy = self.tx.legacy || Chain::from(chain).is_legacy();
+        // Quantum signing requires EIP-1559 fee fields; reject the legacy-fee
+        // path up front instead of failing late in signing.
+        if self.tx.legacy || Chain::from(chain).is_legacy() {
+            eyre::bail!(
+                "forge create --quantum requires EIP-1559 fees; legacy-fee chains and --legacy are not supported"
+            );
+        }
 
         deployer.tx.set_from(deployer_address);
         deployer.tx.set_chain_id(chain);
@@ -698,7 +720,7 @@ impl CreateArgs {
             deployer.tx.set_create();
         }
 
-        self.tx.apply::<QuantumNetwork>(&mut deployer.tx, is_legacy);
+        self.tx.apply::<QuantumNetwork>(&mut deployer.tx, false);
 
         if self.tx.nonce.is_none() {
             deployer.tx.set_nonce(provider.get_transaction_count(deployer_address).await?);
@@ -716,14 +738,11 @@ impl CreateArgs {
             deployer.tx.set_gas_limit(provider.estimate_gas(deployer.tx.clone()).await?);
         }
 
-        if is_legacy {
-            if self.tx.gas_price.is_none() {
-                deployer.tx.set_gas_price(provider.get_gas_price().await?);
-            }
-        } else if self.tx.gas_price.is_none() || self.tx.priority_gas_price.is_none() {
-            let estimate = provider.estimate_eip1559_fees().await.wrap_err(
-                "Failed to estimate EIP1559 fees. This chain might not support EIP1559, try adding --legacy to your command.",
-            )?;
+        if self.tx.gas_price.is_none() || self.tx.priority_gas_price.is_none() {
+            let estimate = provider
+                .estimate_eip1559_fees()
+                .await
+                .wrap_err("Failed to estimate EIP1559 fees; Quantum requires an EIP-1559 chain")?;
             if self.tx.priority_gas_price.is_none() {
                 deployer.tx.set_max_priority_fee_per_gas(estimate.max_priority_fee_per_gas);
             }
@@ -769,9 +788,8 @@ impl CreateArgs {
             return Ok(());
         }
 
-        let primary_seed = primary_seed.ok_or_else(|| {
-            eyre!("--quantum.primary-seed-file is required for Quantum writes")
-        })?;
+        let primary_seed = primary_seed
+            .ok_or_else(|| eyre!("--quantum.primary-seed-file is required for Quantum writes"))?;
 
         let raw_tx = sign_quantum_transaction_request_with_cosigner(
             deployer.tx.clone(),
@@ -793,7 +811,8 @@ impl CreateArgs {
             ));
         }
 
-        let address = receipt.contract_address().ok_or_else(|| eyre!("contract was not deployed"))?;
+        let address =
+            receipt.contract_address().ok_or_else(|| eyre!("contract was not deployed"))?;
         let tx_hash = receipt.transaction_hash();
 
         if shell::is_json() {
@@ -886,9 +905,7 @@ fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -
     if let Some(from) = cli_from
         && from != quantum_sender
     {
-        eyre::bail!(
-            "--from must match --quantum.sender when using the Quantum adapter path"
-        )
+        eyre::bail!("--from must match --quantum.sender when using the Quantum adapter path")
     }
 
     Ok(())

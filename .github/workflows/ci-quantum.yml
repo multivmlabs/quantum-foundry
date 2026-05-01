@@ -1,0 +1,61 @@
+name: CI Quantum
+
+permissions: {}
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: "sccache"
+  QUANTUM_FOUNDRY_BASE_COMMIT: "f1abb2ca347187bb6dea8c3881ca44ce50aab1e7"
+  QUANTUM_HARNESS_COMMIT: "8f3612c60f9fa66ea3a09eab99a2e0802f373673"
+
+jobs:
+  quantum-check:
+    runs-on: depot-ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Quantum-scoped package tests lock the adapter, envelope, and lifecycle
+      # contracts. The broader `cargo test --workspace` target is intentionally
+      # not gated in CI because it inherits upstream Foundry tests that hit
+      # external networks (Etherscan, live mainnet RPC, flaky fork endpoints)
+      # and fail in isolated CI environments regardless of this fork's changes.
+      - name: Quantum package tests
+        run: cargo test -p foundry-common -p foundry-primitives -p foundry-cli -p cast
+
+      # Targeted Quantum regression: pinned golden fixture and composite RLP envelope.
+      # Multiple filters must follow `--` (cargo test accepts only a single
+      # positional TESTNAME before `--`; libtest then applies all post-`--`
+      # filters as an OR under `--exact`).
+      - name: Quantum fixture regression
+        run: |
+          cargo test -p foundry-common --lib -- --exact \
+            transactions::quantum::tests::generated_fixture_matches_checked_in_phase0_example \
+            transactions::quantum::tests::detached_p256_cosigner_is_attached_to_composite_signature

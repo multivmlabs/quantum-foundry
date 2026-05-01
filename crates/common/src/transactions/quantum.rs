@@ -8,8 +8,7 @@ use ml_dsa::{KeyGen, MlDsa44, signature::Keypair};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS, QUANTUM_TX_TYPE_ID,
-    QuantumWriteRequestV1,
+    QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS, QUANTUM_TX_TYPE_ID, QuantumWriteRequestV1,
 };
 use foundry_primitives::QuantumTransactionRequest;
 
@@ -30,13 +29,11 @@ pub const PHASE0_TX_SPAMMER_EVIDENCE_COMMIT: &str = "2c25f14a44b8cc88fc41a65f521
 pub const QUANTUM_ADD_KEY_SELECTOR: [u8; 4] = [0x32, 0xbc, 0x29, 0x19];
 pub const QUANTUM_REMOVE_KEY_SELECTOR: [u8; 4] = [0xc9, 0x8f, 0x21, 0xf4];
 pub const QUANTUM_UPDATE_KEY_AUTH_SELECTOR: [u8; 4] = [0x89, 0x08, 0x15, 0x4b];
-pub const QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE: &str =
-    "KeyVault lifecycle operations beyond bootstrapKey() require explicit lifecycle transaction submission";
+pub const QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE: &str = "KeyVault lifecycle operations beyond bootstrapKey() require explicit lifecycle transaction submission";
 /// Stable rejection message surfaced when a caller tries to simulate a KeyVault
 /// lifecycle selector through `cast call` / `eth_call`. Matches the Phase 0 frozen
 /// contract in `docs/dev/quantum-phase0-implementation-note.md`.
-pub const QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE: &str =
-    "KeyVault lifecycle operations (bootstrap/addKey/removeKey/updateKeyAuth) cannot be simulated via eth_call; use explicit lifecycle transaction submission";
+pub const QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE: &str = "KeyVault lifecycle operations (bootstrap/addKey/removeKey/updateKeyAuth) cannot be simulated via eth_call; use explicit lifecycle transaction submission";
 
 /// Fixed gas limit for Quantum KeyVault bootstrap and lifecycle transactions.
 ///
@@ -46,11 +43,8 @@ pub const QUANTUM_CALL_LIFECYCLE_REJECTION_MESSAGE: &str =
 /// in `quantum-eth2/bin/send-tx/src/main.rs`.
 pub const QUANTUM_LIFECYCLE_GAS_FLOOR: u64 = 2_100_000;
 
-pub const QUANTUM_SEND_UNSUPPORTED_LIFECYCLE_SELECTORS: [[u8; 4]; 3] = [
-    QUANTUM_ADD_KEY_SELECTOR,
-    QUANTUM_REMOVE_KEY_SELECTOR,
-    QUANTUM_UPDATE_KEY_AUTH_SELECTOR,
-];
+pub const QUANTUM_SEND_UNSUPPORTED_LIFECYCLE_SELECTORS: [[u8; 4]; 3] =
+    [QUANTUM_ADD_KEY_SELECTOR, QUANTUM_REMOVE_KEY_SELECTOR, QUANTUM_UPDATE_KEY_AUTH_SELECTOR];
 
 /// All KeyVault lifecycle selectors that are unsupported through `cast call` /
 /// `eth_call`. `bootstrapKey()` is included here because, unlike ordinary sends,
@@ -89,7 +83,7 @@ pub enum DetachedCosignerScheme {
 }
 
 impl DetachedCosignerScheme {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::P256 => QUANTUM_DETACHED_SCHEME_P256,
             Self::Ecdsa => QUANTUM_DETACHED_SCHEME_ECDSA,
@@ -129,10 +123,7 @@ impl DetachedCosigner {
     /// Parse and validate a v1 detached artifact loaded from disk.
     pub fn from_artifact_file(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).map_err(|err| {
-            eyre::eyre!(
-                "failed to read Quantum detached artifact `{}`: {err}",
-                path.display()
-            )
+            eyre::eyre!("failed to read Quantum detached artifact `{}`: {err}", path.display())
         })?;
         Self::from_artifact_json(&bytes)
     }
@@ -180,9 +171,8 @@ impl DetachedCosigner {
 fn parse_hex_bytes(value: &str, field: &str) -> Result<Vec<u8>> {
     let trimmed = value.trim();
     let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
-    alloy_primitives::hex::decode(hex).map_err(|err| {
-        eyre::eyre!("Quantum detached artifact `{field}` is not valid hex: {err}")
-    })
+    alloy_primitives::hex::decode(hex)
+        .map_err(|err| eyre::eyre!("Quantum detached artifact `{field}` is not valid hex: {err}"))
 }
 
 fn parse_hex_b256(value: &str, field: &str) -> Result<B256> {
@@ -264,8 +254,20 @@ pub fn sign_quantum_transaction_request_with_cosigner(
     primary_seed: [u8; ML_DSA_SEED_BYTES],
     cosigner: Option<DetachedCosigner>,
 ) -> Result<QuantumSignedPayload> {
-    if tx.init_primary_pubkey.is_none() && quantum_transaction_request_is_bootstrap(&tx) {
-        tx.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+    // For bootstrap writes, a caller-supplied `init_primary_pubkey` must match
+    // the key derived from the signing seed; otherwise the operator would
+    // initialize a key they cannot sign with. Auto-fill when omitted.
+    if quantum_transaction_request_is_bootstrap(&tx) {
+        let derived = derive_primary_pubkey(primary_seed);
+        match tx.init_primary_pubkey.as_ref() {
+            None => tx.init_primary_pubkey = Some(derived),
+            Some(provided) if provided != &derived => {
+                bail!(
+                    "Quantum bootstrap init_primary_pubkey does not match the public key derived from the signing seed"
+                );
+            }
+            Some(_) => {}
+        }
     }
 
     let request = QuantumWriteRequestV1::from_quantum_transaction_request(&tx)?;
@@ -399,7 +401,7 @@ impl QuantumSigned {
 }
 
 impl SigningKeySignature {
-    fn wire_size(&self) -> usize {
+    const fn wire_size(&self) -> usize {
         match self {
             Self::MlDsa44 { .. } => 1 + ML_DSA_SIGNATURE_BYTES,
             Self::P256 { .. } | Self::Ecdsa { .. } => 1 + DETACHED_CLASSICAL_SIGNATURE_BYTES,
@@ -474,7 +476,7 @@ fn option_as_list_length<T: Encodable>(value: Option<&T>) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use alloy_primitives::U256;
+    use alloy_primitives::{U256, b256};
     use serde_json::Value;
 
     use super::*;
@@ -572,6 +574,29 @@ mod tests {
     }
 
     #[test]
+    fn quantum_transaction_request_bootstrap_rejects_mismatched_primary_pubkey() {
+        let seed = parse_seed_file(&fixture_seed_path()).unwrap();
+        let request = QuantumTransactionRequest {
+            inner: alloy_rpc_types::TransactionRequest::default()
+                .with_chain_id(1337)
+                .with_nonce(0)
+                .with_to(QUANTUM_KEYVAULT_ADDRESS)
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(1)
+                .with_max_priority_fee_per_gas(1)
+                .with_input(Bytes::from(QUANTUM_BOOTSTRAP_SELECTOR.to_vec())),
+            sender: Some(Address::repeat_byte(0x22)),
+            key_id: Some(0),
+            nonce_key: Some(U256::ZERO),
+            init_primary_pubkey: Some(Bytes::from_static(&[0xAAu8; 32])),
+            init_cosigner_pubkey: None,
+        };
+
+        let err = sign_quantum_transaction_request(request, seed).unwrap_err();
+        assert!(err.to_string().contains("init_primary_pubkey"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn generated_fixture_is_valid_json_shape() {
         let fixture = canonical_phase0_fixture();
         let value: Value = serde_json::to_value(fixture).unwrap();
@@ -613,7 +638,7 @@ mod tests {
         DetachedArtifactV1 {
             version: QUANTUM_DETACHED_ARTIFACT_VERSION,
             scheme: scheme.to_string(),
-            signing_hash: format!("{:#x}", signing_hash),
+            signing_hash: format!("{signing_hash:#x}"),
             public_key: format!("0x{}", alloy_primitives::hex::encode([0x11u8; 33])),
             signature: format!(
                 "0x{}",
@@ -650,14 +675,12 @@ mod tests {
         let seed = parse_seed_file(&fixture_seed_path()).unwrap();
         let request = simple_transfer_request(derive_address_from_seed(seed));
         let wrong_hash = B256::repeat_byte(0xaa);
-        let cosigner = DetachedCosigner::from_artifact(artifact_for(
-            QUANTUM_DETACHED_SCHEME_P256,
-            wrong_hash,
-        ))
-        .unwrap();
+        let cosigner =
+            DetachedCosigner::from_artifact(artifact_for(QUANTUM_DETACHED_SCHEME_P256, wrong_hash))
+                .unwrap();
 
-        let err = sign_quantum_write_request_with_cosigner(request, seed, Some(cosigner))
-            .unwrap_err();
+        let err =
+            sign_quantum_write_request_with_cosigner(request, seed, Some(cosigner)).unwrap_err();
         assert!(err.to_string().contains("signing_hash does not match"));
     }
 
@@ -673,12 +696,9 @@ mod tests {
             signing_hash,
         ))
         .unwrap();
-        let signed = sign_quantum_write_request_with_cosigner(
-            request.clone(),
-            seed,
-            Some(cosigner.clone()),
-        )
-        .unwrap();
+        let signed =
+            sign_quantum_write_request_with_cosigner(request.clone(), seed, Some(cosigner.clone()))
+                .unwrap();
 
         let raw = &signed.raw_transaction;
         assert_eq!(raw[0], QUANTUM_TX_TYPE_ID);
@@ -689,6 +709,16 @@ mod tests {
 
         let primary_only = sign_quantum_write_request(request, seed).unwrap();
         assert!(signed.raw_transaction.len() > primary_only.raw_transaction.len());
+
+        // Pinned golden values protect the composite RLP envelope against drift:
+        // any change to field ordering, scheme-byte placement, or cosigner layout
+        // flips these constants and fails the regression.
+        assert_eq!(signed.raw_transaction.len(), 2563);
+        assert_eq!(primary_only.raw_transaction.len(), 2495);
+        assert_eq!(
+            keccak256(&signed.raw_transaction),
+            b256!("8c6ef4e59a3ea673f21c2c7e87e1f02337a77d3aedea6a09862244da7034149a"),
+        );
     }
 
     #[test]
@@ -707,11 +737,9 @@ mod tests {
             sign_quantum_write_request_with_cosigner(request, seed, Some(cosigner.clone()))
                 .unwrap();
 
-        assert!(signed
-            .raw_transaction
-            .windows(1 + DETACHED_CLASSICAL_SIGNATURE_BYTES)
-            .any(|window| window[0] == QUANTUM_ECDSA_SCHEME
-                && window[1..] == cosigner.signature));
+        assert!(signed.raw_transaction.windows(1 + DETACHED_CLASSICAL_SIGNATURE_BYTES).any(
+            |window| { window[0] == QUANTUM_ECDSA_SCHEME && window[1..] == cosigner.signature }
+        ));
     }
 
     #[test]

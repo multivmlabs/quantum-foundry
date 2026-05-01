@@ -13,10 +13,11 @@ use foundry_common::{
     DetachedCosigner, FoundryTransactionBuilder, QUANTUM_ADD_KEY_SELECTOR,
     QUANTUM_BOOTSTRAP_SELECTOR, QUANTUM_KEYVAULT_ADDRESS, QUANTUM_LIFECYCLE_GAS_FLOOR,
     QUANTUM_REMOVE_KEY_SELECTOR, QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE,
-    QUANTUM_UPDATE_KEY_AUTH_SELECTOR, derive_primary_pubkey, parse_seed_file,
-    sign_quantum_transaction_request_with_cosigner,
+    QUANTUM_UPDATE_KEY_AUTH_SELECTOR, derive_primary_pubkey,
     fmt::{UIfmt, UIfmtReceiptExt},
+    parse_seed_file,
     provider::ProviderBuilder,
+    sign_quantum_transaction_request_with_cosigner,
 };
 use foundry_primitives::QuantumNetwork;
 use foundry_wallets::{TempoAccessKeyConfig, WalletSigner};
@@ -113,18 +114,8 @@ impl SendTxArgs {
     }
 
     async fn run_quantum(self) -> Result<()> {
-        let Self {
-            to,
-            mut sig,
-            args,
-            data,
-            send_tx,
-            command,
-            unlocked,
-            force: _,
-            mut tx,
-            path,
-        } = self;
+        let Self { to, mut sig, args, data, send_tx, command, unlocked, force: _, mut tx, path } =
+            self;
 
         if unlocked {
             return Err(eyre!("the Quantum adapter path does not support --unlocked"));
@@ -141,6 +132,21 @@ impl SendTxArgs {
         if path.is_some() {
             return Err(eyre!("the Quantum adapter path does not support blob data"));
         }
+        // Blob flags are applied through the shared `TransactionOpts`, but the
+        // Quantum transaction builder leaves blob setters on their default
+        // no-op implementations, so these flags would be silently dropped
+        // rather than encoded into the 0x7A envelope.
+        if tx.blob || tx.eip4844 || tx.blob_gas_price.is_some() {
+            return Err(eyre!("the Quantum adapter path does not support blob transactions"));
+        }
+        // Quantum signing requires EIP-1559 fee fields; reject the legacy-fee
+        // path up front instead of failing late in request construction.
+        // Mirrors `forge create --quantum` at crates/forge/src/cmd/create.rs.
+        if tx.legacy {
+            return Err(eyre!(
+                "the Quantum adapter path requires EIP-1559 fees; --legacy is not supported"
+            ));
+        }
         if let Some(data) = data {
             sig = Some(data);
         }
@@ -156,6 +162,63 @@ impl SendTxArgs {
             })?;
         let primary_seed = parse_seed_file(seed_path)?;
 
+        // Quantum v1 does not carry EIP-7702 authorization lists in the signed
+        // envelope (`QuantumTxEnvelope::authorization_list()` returns `None`).
+        // Reject `--auth` explicitly so callers do not believe a 7702 auth is
+        // being broadcast when it would be silently dropped.
+        if !tx.auth.is_empty() {
+            return Err(eyre!(
+                "the Quantum adapter path does not support EIP-7702 `--auth`; the v1 envelope does not carry authorization lists"
+            ));
+        }
+
+        let config = send_tx.eth.load_config()?;
+        let provider = ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
+
+        if let Some(interval) = send_tx.poll_interval {
+            provider.client().set_poll_interval(Duration::from_secs(interval));
+        }
+
+        // Resolve the destination up front so the lifecycle fence and bootstrap
+        // gas-floor block observe the true destination address, not an
+        // unresolved name/ENS target. A name that resolves to the KeyVault
+        // would otherwise slip past the literal-address check below.
+        let resolved_to = match to {
+            Some(to) => Some(to.resolve(&provider).await?),
+            None => None,
+        };
+
+        // Fail closed before any RPC simulation: ordinary `cast send` must not accept
+        // unsupported KeyVault lifecycle selectors (addKey / removeKey / updateKeyAuth).
+        // Only `bootstrapKey()` is supported from this path in v1.
+        let destination_is_keyvault = resolved_to == Some(QUANTUM_KEYVAULT_ADDRESS);
+        if destination_is_keyvault && quantum_input_is_unsupported_lifecycle(sig.as_deref()) {
+            return Err(eyre!(QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE));
+        }
+
+        let is_bootstrap = destination_is_keyvault && quantum_input_is_bootstrap(sig.as_deref());
+
+        // `bootstrapKey()` is non-payable: forwarding ETH to it is an operator
+        // mistake. The dedicated `cast quantum bootstrap` UX rejects `--value`
+        // for all lifecycle writes; mirror the invariant here so both sanctioned
+        // entry points behave the same for the bootstrap selector.
+        if is_bootstrap && tx.value.is_some_and(|v| !v.is_zero()) {
+            return Err(eyre!(
+                "Quantum bootstrap does not accept `--value`; bootstrapKey() is non-payable"
+            ));
+        }
+
+        // v1 bootstrap is primary-only: `cast quantum bootstrap` rejects any
+        // cosigner artifact, and `cast send --quantum` must enforce the same
+        // invariant so both sanctioned entry points produce the same envelope
+        // shape. Cosigner attachment is a signature-side artifact, so this
+        // cannot be caught by `QuantumWriteRequestV1::validate_v1`.
+        if is_bootstrap && tx.quantum.cosigner_artifact.is_some() {
+            return Err(eyre!(
+                "Quantum v1 bootstrap is primary-only; cosigner artifact is not supported"
+            ));
+        }
+
         let cosigner = tx
             .quantum
             .cosigner_artifact
@@ -163,18 +226,20 @@ impl SendTxArgs {
             .map(DetachedCosigner::from_artifact_file)
             .transpose()?;
 
-        // Fail closed before any RPC simulation: ordinary `cast send` must not accept
-        // unsupported KeyVault lifecycle selectors (addKey / removeKey / updateKeyAuth).
-        // Only `bootstrapKey()` is supported from this path in v1.
-        if quantum_destination_is_keyvault(to.as_ref())
-            && quantum_input_is_unsupported_lifecycle(sig.as_deref())
-        {
-            return Err(eyre!(QUANTUM_SEND_LIFECYCLE_REJECTION_MESSAGE));
-        }
-
-        if quantum_send_requests_bootstrap(to.as_ref(), sig.as_deref()) {
-            if tx.quantum.init_primary_pubkey.is_none() {
-                tx.quantum.init_primary_pubkey = Some(derive_primary_pubkey(primary_seed));
+        if is_bootstrap {
+            // Mirror the dedicated `cast quantum bootstrap` invariant: a
+            // caller-supplied `init_primary_pubkey` must match the key derived
+            // from the signing seed, otherwise the operator initializes a key
+            // they cannot sign with. Auto-fill when omitted.
+            let derived = derive_primary_pubkey(primary_seed);
+            match tx.quantum.init_primary_pubkey.as_ref() {
+                None => tx.quantum.init_primary_pubkey = Some(derived),
+                Some(provided) if provided != &derived => {
+                    return Err(eyre!(
+                        "--quantum.init-primary-pubkey does not match the public key derived from --quantum.primary-seed-file; omit the flag to auto-fill"
+                    ));
+                }
+                Some(_) => {}
             }
             // Bootstrap/lifecycle calls cannot be simulated via `eth_estimateGas` because
             // the validator-published bootstrap transient state is absent. Apply the fixed
@@ -185,26 +250,16 @@ impl SendTxArgs {
             }
         }
 
-        let config = send_tx.eth.load_config()?;
-        let provider = ProviderBuilder::<QuantumNetwork>::from_config(&config)?.build()?;
-
-        if let Some(interval) = send_tx.poll_interval {
-            provider.client().set_poll_interval(Duration::from_secs(interval));
-        }
-
         let builder = CastTxBuilder::new(&provider, tx.clone(), &config)
             .await?
-            .with_to(to)
+            .with_to(resolved_to.map(NameOrAddress::Address))
             .await?
             .with_code_sig_and_args(None, sig, args)
             .await?;
 
         let (tx_request, _) = builder.build(sender).await?;
-        let payload = sign_quantum_transaction_request_with_cosigner(
-            tx_request,
-            primary_seed,
-            cosigner,
-        )?;
+        let payload =
+            sign_quantum_transaction_request_with_cosigner(tx_request, primary_seed, cosigner)?;
 
         let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
         let cast = CastTxSender::new(&provider);
@@ -442,47 +497,42 @@ fn validate_quantum_sender(cli_from: Option<Address>, quantum_sender: Address) -
     if let Some(from) = cli_from
         && from != quantum_sender
     {
-        eyre::bail!(
-            "--from must match --quantum.sender when using the Quantum adapter path"
-        )
+        eyre::bail!("--from must match --quantum.sender when using the Quantum adapter path")
     }
 
     Ok(())
 }
 
-fn quantum_send_requests_bootstrap(to: Option<&NameOrAddress>, input: Option<&str>) -> bool {
-    quantum_destination_is_keyvault(to) && quantum_input_is_bootstrap(input)
+fn strip_hex_prefix(value: &str) -> &str {
+    value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value)
 }
 
-fn quantum_destination_is_keyvault(to: Option<&NameOrAddress>) -> bool {
-    match to {
-        Some(NameOrAddress::Address(addr)) => *addr == QUANTUM_KEYVAULT_ADDRESS,
-        Some(NameOrAddress::Name(name)) => {
-            Address::from_str(name).ok() == Some(QUANTUM_KEYVAULT_ADDRESS)
-        }
-        None => false,
-    }
+/// Return the portion of `sig` before the first `(`, with surrounding
+/// whitespace stripped. Used to match bare function names (no parentheses) the
+/// same way signatures like `bootstrapKey()` are matched — callers like
+/// `parse_function_args` fall through to Etherscan lookup for bare names, so
+/// the lifecycle fence must recognize them locally to avoid being bypassed.
+fn function_name_prefix(sig: &str) -> &str {
+    let trimmed = sig.trim();
+    trimmed.split_once('(').map_or(trimmed, |(name, _)| name.trim())
 }
 
 fn quantum_input_is_bootstrap(input: Option<&str>) -> bool {
     let Some(input) = input else { return false };
-    input.starts_with("bootstrapKey(")
-        || input
-            .trim()
-            .trim_start_matches("0x")
-            .starts_with(&hex::encode(QUANTUM_BOOTSTRAP_SELECTOR))
+    if function_name_prefix(input) == "bootstrapKey" {
+        return true;
+    }
+    let hex_body = strip_hex_prefix(input.trim()).to_ascii_lowercase();
+    hex_body.starts_with(&hex::encode(QUANTUM_BOOTSTRAP_SELECTOR))
 }
 
 fn quantum_input_is_unsupported_lifecycle(input: Option<&str>) -> bool {
     let Some(input) = input else { return false };
     let trimmed = input.trim();
-    if trimmed.starts_with("addKey(")
-        || trimmed.starts_with("removeKey(")
-        || trimmed.starts_with("updateKeyAuth(")
-    {
+    if matches!(function_name_prefix(trimmed), "addKey" | "removeKey" | "updateKeyAuth") {
         return true;
     }
-    let hex_body = trimmed.trim_start_matches("0x").to_ascii_lowercase();
+    let hex_body = strip_hex_prefix(trimmed).to_ascii_lowercase();
     let add = hex::encode(QUANTUM_ADD_KEY_SELECTOR);
     let remove = hex::encode(QUANTUM_REMOVE_KEY_SELECTOR);
     let update = hex::encode(QUANTUM_UPDATE_KEY_AUTH_SELECTOR);
@@ -520,10 +570,29 @@ where
 mod tests {
     use clap::CommandFactory;
 
-    use super::SendTxArgs;
+    use super::{SendTxArgs, quantum_input_is_bootstrap, quantum_input_is_unsupported_lifecycle};
 
     #[test]
     fn send_command_clap_shape_is_valid() {
         SendTxArgs::command().debug_assert();
+    }
+
+    #[test]
+    fn bare_lifecycle_names_trip_the_fence() {
+        assert!(quantum_input_is_bootstrap(Some("bootstrapKey")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some("addKey")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some("removeKey")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some("updateKeyAuth")));
+        // Unrelated bare names must not be treated as lifecycle calls.
+        assert!(!quantum_input_is_bootstrap(Some("transfer")));
+        assert!(!quantum_input_is_unsupported_lifecycle(Some("transfer")));
+    }
+
+    #[test]
+    fn parenthesized_lifecycle_names_still_trip_the_fence() {
+        assert!(quantum_input_is_bootstrap(Some("bootstrapKey()")));
+        assert!(quantum_input_is_unsupported_lifecycle(Some(
+            "addKey(uint32,bytes,uint8,bytes,uint8,uint8,bytes)"
+        )));
     }
 }
