@@ -1,0 +1,15 @@
+{
+  "source": "quantum-eth2/crates/e2e/tests/transactions.rs",
+  "quantum_harness_commit": "8f3612c60f9fa66ea3a09eab99a2e0802f373673",
+  "note": "Pinned receipt-field contract for Phase 0 and later deploy parity checks. Replace with a captured harness receipt if the field contract changes.",
+  "required_fields": [
+    "status",
+    "transactionHash",
+    "contractAddress"
+  ],
+  "example": {
+    "status": "0x1",
+    "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "contractAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}

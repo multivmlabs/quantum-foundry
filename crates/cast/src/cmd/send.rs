@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_ens::NameOrAddress;
-use alloy_network::{Ethereum, EthereumWallet, Network};
+use alloy_network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
 use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder as AlloyProviderBuilder};
 use alloy_signer::{Signature, Signer};
@@ -19,6 +19,7 @@ use tempo_alloy::TempoNetwork;
 
 use crate::{
     cmd::tip20::iso4217_warning_message,
+    quantum::{QuantumWriteContractV1, build_phase0_payload, parse_seed_file},
     tx::{self, CastTxBuilder, CastTxSender, SendTxOpts},
 };
 use tempo_contracts::precompiles::{TIP20_FACTORY_ADDRESS, is_iso4217_currency};
@@ -93,6 +94,10 @@ pub enum SendTxSubcommands {
 
 impl SendTxArgs {
     pub async fn run(self) -> Result<()> {
+        if self.tx.quantum.is_quantum() {
+            return self.run_quantum().await;
+        }
+
         // Resolve the signer early so we know if it's a Tempo access key.
         let (signer, tempo_access_key) = self.send_tx.eth.wallet.maybe_signer().await?;
 
@@ -101,6 +106,91 @@ impl SendTxArgs {
         } else {
             self.run_generic::<Ethereum>(signer, None).await
         }
+    }
+
+    async fn run_quantum(self) -> Result<()> {
+        let Self { to, mut sig, args, data, send_tx, command, unlocked, force: _, tx, path } =
+            self;
+
+        if unlocked {
+            return Err(eyre!("the Phase 0 Quantum seam does not support --unlocked"));
+        }
+        if send_tx.browser.browser {
+            return Err(eyre!("the Phase 0 Quantum seam does not support browser signing"));
+        }
+        if tx.tempo.is_tempo() {
+            return Err(eyre!("Quantum and Tempo options cannot be combined"));
+        }
+        if command.is_some() {
+            return Err(eyre!("the Phase 0 Quantum seam only supports cast send-style call flows"));
+        }
+        if path.is_some() {
+            return Err(eyre!("the Phase 0 Quantum seam does not support blob data"));
+        }
+        if let Some(data) = data {
+            sig = Some(data);
+        }
+
+        let sender = tx.quantum.sender.ok_or_else(|| {
+            eyre!("--quantum.sender is required for the Phase 0 Quantum seam")
+        })?;
+        let seed_path = tx.quantum.primary_seed_file.as_ref().ok_or_else(|| {
+            eyre!("--quantum.primary-seed-file is required for the Phase 0 Quantum seam")
+        })?;
+        let primary_seed = parse_seed_file(seed_path)?;
+
+        let config = send_tx.eth.load_config()?;
+        let provider = ProviderBuilder::<Ethereum>::from_config(&config)?.build()?;
+
+        if let Some(interval) = send_tx.poll_interval {
+            provider.client().set_poll_interval(Duration::from_secs(interval));
+        }
+
+        let builder = CastTxBuilder::new(&provider, tx.clone(), &config)
+            .await?
+            .with_to(to)
+            .await?
+            .with_code_sig_and_args(None, sig, args)
+            .await?;
+
+        let (tx_request, _) = builder.build(sender).await?;
+        let kind = TransactionBuilder::kind(&tx_request)
+            .ok_or_else(|| eyre!("Quantum Phase 0 requires an explicit call destination"))?;
+        let max_fee_per_gas = TransactionBuilder::max_fee_per_gas(&tx_request)
+            .ok_or_else(|| eyre!("failed to resolve max fee per gas for Quantum transaction"))?;
+        let max_priority_fee_per_gas = TransactionBuilder::max_priority_fee_per_gas(&tx_request)
+            .ok_or_else(|| {
+                eyre!("failed to resolve max priority fee per gas for Quantum transaction")
+            })?;
+        let gas_limit = TransactionBuilder::gas_limit(&tx_request)
+            .ok_or_else(|| eyre!("failed to resolve gas limit for Quantum transaction"))?;
+        let nonce = TransactionBuilder::nonce(&tx_request)
+            .ok_or_else(|| eyre!("failed to resolve nonce for Quantum transaction"))?;
+        let chain_id = TransactionBuilder::chain_id(&tx_request)
+            .ok_or_else(|| eyre!("failed to resolve chain ID for Quantum transaction"))?;
+
+        let payload = build_phase0_payload(QuantumWriteContractV1 {
+            sender,
+            key_id: tx.quantum.resolved_key_id(),
+            nonce,
+            chain_id,
+            max_priority_fee_per_gas,
+            max_fee_per_gas,
+            gas_limit,
+            kind,
+            value: TransactionBuilder::value(&tx_request).unwrap_or_default(),
+            input: TransactionBuilder::input(&tx_request).cloned().unwrap_or_default(),
+            access_list: TransactionBuilder::access_list(&tx_request)
+                .cloned()
+                .unwrap_or_default(),
+            primary_seed,
+        })?;
+
+        let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
+        let cast = CastTxSender::new(&provider);
+        let pending = cast.send_raw(&payload.raw_transaction).await?;
+        let tx_hash = *pending.inner().tx_hash();
+        cast.print_tx_result(tx_hash, send_tx.cast_async, send_tx.confirmations, timeout).await
     }
 
     pub async fn run_generic<N: Network>(
@@ -353,4 +443,16 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::SendTxArgs;
+
+    #[test]
+    fn send_command_clap_shape_is_valid() {
+        SendTxArgs::command().debug_assert();
+    }
 }
