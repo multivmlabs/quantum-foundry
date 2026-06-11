@@ -84,7 +84,7 @@ Key Quantum extensions on top of upstream Foundry:
   - `--quantum` and the `--quantum.*` flags route CREATE through the shared Quantum adapter with the same explicit sender / key-id / seed / cosigner contract as `cast send`.
 
 - In `forge script`:
-  - Scripted broadcast routes through the shared Quantum adapter for supported write shapes and fails closed on unsupported Quantum script shapes with a stable rejection message.
+  - `--quantum` intentionally fails closed in v1: scripted Quantum broadcasts are not yet wired through the native `0x7A` adapter. Split scripted write flows into individual `cast send --quantum` / `forge create --quantum` invocations, or rerun without `--quantum` against an Ethereum-compatible network.
 
 - Additionally:
   - A shared `QuantumWriteRequestV1` write contract with fail-closed v1 validation: `nonce_key` must be `0`, multi-call bundles are rejected, and lifecycle-selector misuse is caught before signing.
