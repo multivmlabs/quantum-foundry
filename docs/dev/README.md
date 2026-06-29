@@ -52,6 +52,7 @@ $ make pr
 - [Debugging](./debugging.md)
 - [Quantum Phase 0 Implementation Note](./quantum-phase0-implementation-note.md)
 - [Quantum Adapter Touchpoints](./quantum-adapter-touchpoints.md)
+- [Quantum Read-Path Adapter Conformance Checklist](./quantum-read-path-adapter-conformance-checklist.md)
 - [Scripting](./scripting.md)
 - [Custom Network Features](./networks.md)
 
@@ -65,6 +66,7 @@ Use these docs as the source of truth before rebasing or widening the adapter su
 
 - [Quantum Phase 0 Implementation Note](./quantum-phase0-implementation-note.md)
 - [Quantum Adapter Touchpoints](./quantum-adapter-touchpoints.md)
+- [Quantum Read-Path Adapter Conformance Checklist](./quantum-read-path-adapter-conformance-checklist.md)
 
 ## Getting in Touch
 
