@@ -24,6 +24,8 @@ These files are already intentionally diverged from upstream as part of the Phas
   - indexes the Quantum implementation note and this touchpoint manifest
 - `docs/dev/quantum-phase0-implementation-note.md`
   - freezes the Phase 0 RPC, signer, and operator contract
+- `docs/dev/quantum-read-path-adapter-conformance-checklist.md`
+  - documents read-path conformance expectations for explorers, indexers, analytics, and APIs that need to preserve Quantum transaction evidence without making write-path or live-network claims
 - `crates/cli/src/opts/mod.rs`
 - `crates/cli/src/opts/transaction.rs`
 - `crates/cli/src/opts/quantum.rs`
